@@ -18,15 +18,16 @@ import (
 )
 
 const (
-	repoReadMaxBytes      = 256 * 1024
-	repoSearchMaxFiles    = 500
-	repoSearchMaxResults  = 50
-	repoListMaxEntries    = 200
-	repoSearchLineMax     = 8 * 1024
-	logDefaultLines       = 80
-	logMaxLines           = 200
-	logMaxOutputBytes     = 64 * 1024
-	miniDeployMaxResponse = 8 * 1024 * 1024
+	repoReadMaxBytes         = 256 * 1024
+	repoSearchMaxFiles       = 500
+	repoSearchMaxResults     = 50
+	repoSearchMaxHitsPerFile = 5
+	repoListMaxEntries       = 200
+	repoSearchLineMax        = 8 * 1024
+	logDefaultLines          = 80
+	logMaxLines              = 200
+	logMaxOutputBytes        = 64 * 1024
+	miniDeployMaxResponse    = 8 * 1024 * 1024
 )
 
 type repoEntry struct {
@@ -271,9 +272,16 @@ func (a *app) searchRepository(ctx context.Context, appName, rel, query string) 
 	if !info.IsDir() {
 		return repoSearchResponse{}, fmt.Errorf("search path is not a directory")
 	}
-	out := repoSearchResponse{App: appName, Query: query, Path: slashPath(cleanRel), Hits: []repoSearchHit{}}
+
+	out := repoSearchResponse{
+		App:   appName,
+		Query: query,
+		Path:  slashPath(cleanRel),
+		Hits:  []repoSearchHit{},
+	}
 	needle := strings.ToLower(query)
 	stop := errors.New("search complete")
+
 	err = filepath.WalkDir(start, func(path string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return nil
@@ -283,6 +291,7 @@ func (a *app) searchRepository(ctx context.Context, appName, rel, query string) 
 			return ctx.Err()
 		default:
 		}
+
 		if path != start && (isBlockedRepoComponent(d.Name()) || d.Type()&os.ModeSymlink != 0) {
 			if d.IsDir() {
 				return filepath.SkipDir
@@ -292,41 +301,73 @@ func (a *app) searchRepository(ctx context.Context, appName, rel, query string) 
 		if d.IsDir() {
 			return nil
 		}
-		if out.FilesScanned >= repoSearchMaxFiles || len(out.Hits) >= repoSearchMaxResults {
+		if out.FilesScanned >= repoSearchMaxFiles {
 			out.Truncated = true
 			return stop
 		}
+
 		entryInfo, statErr := d.Info()
 		if statErr != nil || !entryInfo.Mode().IsRegular() || entryInfo.Size() > repoReadMaxBytes || isObviousBinaryName(d.Name()) {
 			return nil
 		}
+
 		f, openErr := os.Open(path)
 		if openErr != nil {
 			return nil
 		}
-		defer f.Close()
 		out.FilesScanned++
+
+		relPath, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			_ = f.Close()
+			return nil
+		}
+		relPath = slashPath(relPath)
+
+		fileHits := make([]repoSearchHit, 0, repoSearchMaxHitsPerFile)
 		scanner := bufio.NewScanner(io.LimitReader(f, repoReadMaxBytes+1))
 		scanner.Buffer(make([]byte, 16*1024), repoSearchLineMax)
 		lineNo := 0
+
 		for scanner.Scan() {
 			lineNo++
 			line := scanner.Text()
 			if strings.IndexByte(line, 0) >= 0 {
 				break
 			}
-			if strings.Contains(strings.ToLower(line), needle) {
-				text, _ := scrubSensitiveText(strings.TrimSpace(line))
-				text = truncateRunes(text, 320)
-				relPath, relErr := filepath.Rel(root, path)
-				if relErr == nil {
-					out.Hits = append(out.Hits, repoSearchHit{Path: slashPath(relPath), Line: lineNo, Text: text})
-				}
-				if len(out.Hits) >= repoSearchMaxResults {
-					out.Truncated = true
-					return stop
-				}
+			if !strings.Contains(strings.ToLower(line), needle) {
+				continue
 			}
+			if len(fileHits) >= repoSearchMaxHitsPerFile {
+				out.Truncated = true
+				break
+			}
+
+			text, _ := scrubSensitiveText(strings.TrimSpace(line))
+			text = truncateRunes(text, 320)
+			fileHits = append(fileHits, repoSearchHit{
+				Path: relPath,
+				Line: lineNo,
+				Text: text,
+			})
+		}
+		_ = f.Close()
+
+		remaining := repoSearchMaxResults - len(out.Hits)
+		if remaining <= 0 {
+			out.Truncated = true
+			return stop
+		}
+		if len(fileHits) > remaining {
+			out.Hits = append(out.Hits, fileHits[:remaining]...)
+			out.Truncated = true
+			return stop
+		}
+		out.Hits = append(out.Hits, fileHits...)
+
+		if len(out.Hits) >= repoSearchMaxResults {
+			out.Truncated = true
+			return stop
 		}
 		return nil
 	})

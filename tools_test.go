@@ -67,6 +67,40 @@ func TestSearchRepositorySkipsBlockedDirectories(t *testing.T) {
 	}
 }
 
+func TestSearchRepositoryCapsMatchesPerFile(t *testing.T) {
+	repo, a := makeToolRepo(t)
+
+	var docs strings.Builder
+	for i := 0; i < 20; i++ {
+		docs.WriteString("schedule documentation line\n")
+	}
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte(docs.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := a.searchRepository(context.Background(), "myscheduler", ".", "schedule")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	readmeHits := 0
+	foundCode := false
+	for _, hit := range got.Hits {
+		if hit.Path == "README.md" {
+			readmeHits++
+		}
+		if hit.Path == "backend/routes/schedule.js" {
+			foundCode = true
+		}
+	}
+	if readmeHits > repoSearchMaxHitsPerFile {
+		t.Fatalf("README hits = %d, want <= %d", readmeHits, repoSearchMaxHitsPerFile)
+	}
+	if !foundCode {
+		t.Fatalf("search did not reach application code: %+v", got)
+	}
+}
+
 func TestTrimLogOutput(t *testing.T) {
 	got, truncated := trimLogOutput("one\ntwo\nthree\nfour\n", 2, 1024)
 	if !truncated || got != "three\nfour" {
