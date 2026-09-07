@@ -82,3 +82,75 @@ func TestEncodeAgentToolResultCapsContext(t *testing.T) {
 		t.Fatalf("expected truncation marker")
 	}
 }
+
+func TestRepositoryEvidenceGuardrailPrefersRouteSource(t *testing.T) {
+	search := repoSearchResponse{
+		App: "myscheduler",
+		Hits: []repoSearchHit{
+			{Path: "README.md", Line: 1, Text: "schedule"},
+			{Path: "backend/db/repository.js", Line: 10, Text: "schedule"},
+			{Path: "backend/routes/scheduleRoutes.js", Line: 4, Text: "schedule"},
+		},
+	}
+	got := bestUnreadSourcePaths(search, map[string]bool{}, "schedule", 1)
+	if len(got) != 1 || got[0] != "backend/routes/scheduleRoutes.js" {
+		t.Fatalf("bestUnreadSourcePaths=%v", got)
+	}
+}
+
+func TestRepositoryEvidenceGuardrailUsesQueryAffinity(t *testing.T) {
+	search := repoSearchResponse{
+		App:   "myscheduler",
+		Query: "schedule-template",
+		Hits: []repoSearchHit{
+			{Path: "backend/app.js", Line: 21, Text: `app.use("/api/schedule-templates", scheduleTemplateRoutes)`},
+			{Path: "backend/routes/scheduleTemplateRoutes.js", Line: 8, Text: `router.get("/", async (req, res) => {`},
+			{Path: "backend/routes/scheduleRoutes.js", Line: 4, Text: `router.get("/schedule", handler)`},
+		},
+	}
+	got := bestUnreadSourcePaths(search, map[string]bool{}, "schedule-template", 2)
+	if len(got) != 2 {
+		t.Fatalf("bestUnreadSourcePaths=%v", got)
+	}
+	if got[0] != "backend/routes/scheduleTemplateRoutes.js" {
+		t.Fatalf("query-specific route should rank first, got %v", got)
+	}
+}
+
+func TestCompactAgentSearchResultLimitsHits(t *testing.T) {
+	search := repoSearchResponse{App: "myscheduler", Query: "schedule"}
+	for i := 0; i < 10; i++ {
+		search.Hits = append(search.Hits, repoSearchHit{Path: "README.md", Line: i + 1, Text: strings.Repeat("x", 250)})
+	}
+	for i := 0; i < 10; i++ {
+		search.Hits = append(search.Hits, repoSearchHit{Path: "backend/routes/scheduleRoutes.js", Line: i + 1, Text: strings.Repeat("y", 250)})
+	}
+	got, ok := compactAgentToolResult("search_repository", search).(repoSearchResponse)
+	if !ok {
+		t.Fatal("unexpected compact result type")
+	}
+	if len(got.Hits) > agentSearchMaxHits {
+		t.Fatalf("hits=%d", len(got.Hits))
+	}
+	perFile := map[string]int{}
+	for _, hit := range got.Hits {
+		perFile[hit.Path]++
+		if len([]rune(hit.Text)) > 181 {
+			t.Fatalf("snippet too long: %d", len([]rune(hit.Text)))
+		}
+	}
+	for path, n := range perFile {
+		if n > agentSearchMaxPerFile {
+			t.Fatalf("%s has %d hits", path, n)
+		}
+	}
+}
+
+func TestRequiresRepositoryEvidence(t *testing.T) {
+	if !requiresRepositoryEvidence("Which route file defines the endpoint?") {
+		t.Fatal("expected repository evidence requirement")
+	}
+	if requiresRepositoryEvidence("Is MyScheduler healthy?") {
+		t.Fatal("unexpected repository evidence requirement")
+	}
+}
