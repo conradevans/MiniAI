@@ -33,12 +33,13 @@ const (
 )
 
 type app struct {
-	started    time.Time
-	addr       string
-	ollamaURL  string
-	reactorURL string
-	repoRoot   string
-	client     *http.Client
+	started       time.Time
+	addr          string
+	ollamaURL     string
+	reactorURL    string
+	minideployURL string
+	repoRoot      string
+	client        *http.Client
 
 	mu       sync.Mutex
 	sessions map[string]*session
@@ -172,13 +173,14 @@ type psResponse struct {
 
 func main() {
 	a := &app{
-		started:    time.Now(),
-		addr:       env("MINIAI_ADDR", "127.0.0.1:9300"),
-		ollamaURL:  strings.TrimRight(env("OLLAMA_URL", "http://127.0.0.1:11434"), "/"),
-		reactorURL: strings.TrimRight(env("REACTORLAB_URL", "http://127.0.0.1:9200"), "/"),
-		repoRoot:   env("MINIAI_REPO_ROOT", "/srv"),
-		client:     &http.Client{Timeout: 10 * time.Minute},
-		sessions:   make(map[string]*session),
+		started:       time.Now(),
+		addr:          env("MINIAI_ADDR", "127.0.0.1:9300"),
+		ollamaURL:     strings.TrimRight(env("OLLAMA_URL", "http://127.0.0.1:11434"), "/"),
+		reactorURL:    strings.TrimRight(env("REACTORLAB_URL", "http://127.0.0.1:9200"), "/"),
+		minideployURL: strings.TrimRight(env("MINIDEPLOY_URL", "http://127.0.0.1:9000"), "/"),
+		repoRoot:      env("MINIAI_REPO_ROOT", "/srv"),
+		client:        &http.Client{Timeout: 10 * time.Minute},
+		sessions:      make(map[string]*session),
 	}
 
 	mux := http.NewServeMux()
@@ -186,6 +188,11 @@ func main() {
 	mux.HandleFunc("GET /api/v1/status", a.handleStatus)
 	mux.HandleFunc("GET /api/v1/apps", a.handleApps)
 	mux.HandleFunc("GET /api/v1/apps/{app}/context", a.handleAppContext)
+	mux.HandleFunc("GET /api/v1/apps/{app}/repo/list", a.handleRepoList)
+	mux.HandleFunc("GET /api/v1/apps/{app}/repo/file", a.handleRepoFile)
+	mux.HandleFunc("GET /api/v1/apps/{app}/repo/search", a.handleRepoSearch)
+	mux.HandleFunc("GET /api/v1/apps/{app}/logs/runtime", a.handleRuntimeLogs)
+	mux.HandleFunc("GET /api/v1/apps/{app}/logs/deployment", a.handleDeploymentLogs)
 	mux.HandleFunc("POST /api/v1/session", a.handleCreateSession)
 	mux.HandleFunc("POST /api/v1/session/{id}/heartbeat", a.handleHeartbeat)
 	mux.HandleFunc("DELETE /api/v1/session/{id}", a.handleDeleteSession)
