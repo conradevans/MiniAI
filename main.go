@@ -452,6 +452,11 @@ func (a *app) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if shouldUseAgentTools(req.Message) {
+		a.handleAgentChatStream(w, r, req, policy)
+		return
+	}
+
 	prompt, contextApps := a.buildContextualPrompt(r.Context(), req.Message)
 
 	flusher, ok := w.(http.Flusher)
