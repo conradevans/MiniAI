@@ -2,30 +2,30 @@ package main
 
 import "testing"
 
-func TestChooseModelPrimary(t *testing.T) {
-	got := chooseModel(SystemStatus{AvailableMemoryGiB: 13, Load1: 0.5})
-	if !got.Allowed || got.Mode != "primary" || got.Model != primaryModel {
-		t.Fatalf("expected primary model, got %+v", got)
+func TestChoosePolicyPrimary(t *testing.T) {
+	p := choosePolicy(systemStatus{AvailableMemoryGiB: 13.5, Load1: 0.2}, nil)
+	if !p.Allowed || p.Model != primaryModel || p.Mode != "primary" {
+		t.Fatalf("unexpected policy: %+v", p)
 	}
 }
 
-func TestChooseModelFallbackForMemory(t *testing.T) {
-	got := chooseModel(SystemStatus{AvailableMemoryGiB: 8.5, Load1: 1})
-	if !got.Allowed || got.Mode != "fallback" || got.Model != fallbackModel {
-		t.Fatalf("expected fallback model, got %+v", got)
+func TestChoosePolicyFallback(t *testing.T) {
+	p := choosePolicy(systemStatus{AvailableMemoryGiB: 8.0, Load1: 1.0}, nil)
+	if !p.Allowed || p.Model != fallbackModel || p.Mode != "fallback" {
+		t.Fatalf("unexpected policy: %+v", p)
 	}
 }
 
-func TestChooseModelFallbackForLoad(t *testing.T) {
-	got := chooseModel(SystemStatus{AvailableMemoryGiB: 13, Load1: 9})
-	if !got.Allowed || got.Mode != "fallback" || got.Model != fallbackModel {
-		t.Fatalf("expected fallback model, got %+v", got)
+func TestChoosePolicyBlocked(t *testing.T) {
+	p := choosePolicy(systemStatus{AvailableMemoryGiB: 5.0, Load1: 1.0}, nil)
+	if p.Allowed || p.Mode != "blocked" {
+		t.Fatalf("unexpected policy: %+v", p)
 	}
 }
 
-func TestChooseModelBlocked(t *testing.T) {
-	got := chooseModel(SystemStatus{AvailableMemoryGiB: 5.5, Load1: 1})
-	if got.Allowed || got.Mode != "blocked" {
-		t.Fatalf("expected blocked policy, got %+v", got)
+func TestLoadedPrimaryStaysPrimary(t *testing.T) {
+	p := choosePolicy(systemStatus{AvailableMemoryGiB: 7.5, Load1: 9.0}, []string{primaryModel})
+	if !p.Allowed || p.Model != primaryModel {
+		t.Fatalf("loaded primary should remain selected: %+v", p)
 	}
 }
