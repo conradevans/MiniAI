@@ -215,6 +215,7 @@ func main() {
 	mux.HandleFunc("POST /api/v1/session/{id}/heartbeat", a.handleHeartbeat)
 	mux.HandleFunc("DELETE /api/v1/session/{id}", a.handleDeleteSession)
 	mux.HandleFunc("POST /api/v1/chat/stream", a.handleChatStream)
+	a.registerWebRoutes(mux)
 
 	go a.reaper()
 

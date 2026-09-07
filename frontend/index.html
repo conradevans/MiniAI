@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#07090c">
+  <title>MiniAI · ReactorLab</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/styles.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand-row">
+        <a class="brand" href="/" aria-label="MiniAI home">
+          <span class="brand-mark">AI</span>
+          <span>
+            <strong>MiniAI</strong>
+            <small>Local infrastructure assistant</small>
+          </span>
+        </a>
+        <button class="icon-button mobile-only" id="closeSidebar" aria-label="Close sidebar">×</button>
+      </div>
+
+      <div class="product-tabs" aria-label="ReactorLab products">
+        <a href="https://reactorlab.dev/admin">ReactorLab</a>
+        <a href="https://minideploy.reactorlab.dev/admin/">MiniDeploy</a>
+        <a href="https://minibase.reactorlab.dev/admin">MiniBase</a>
+        <span class="active">MiniAI</span>
+      </div>
+
+      <button class="new-chat" id="newChatButton">
+        <span class="plus">+</span>
+        New chat
+      </button>
+
+      <div class="history-head">
+        <span>Chats</span>
+        <button class="icon-button" id="refreshChats" aria-label="Refresh chats">↻</button>
+      </div>
+
+      <nav class="chat-list" id="chatList" aria-label="Chat history"></nav>
+
+      <div class="sidebar-footer">
+        <div class="read-only-badge"><span class="dot"></span> Read-only</div>
+        <p>MiniAI can inspect ReactorLab, repositories, and redacted logs. It cannot deploy, restart, write files, or modify databases.</p>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button class="icon-button mobile-only" id="openSidebar" aria-label="Open sidebar">☰</button>
+          <div>
+            <span class="eyebrow">REACTORLAB / MINIAI</span>
+            <div class="chat-title" id="chatTitle">New chat</div>
+          </div>
+        </div>
+
+        <div class="runtime-pill" id="runtimePill" title="MiniAI runtime status">
+          <span class="status-dot" id="runtimeDot"></span>
+          <span>
+            <strong id="runtimeLabel">Checking…</strong>
+            <small id="runtimeSub">Local · read-only</small>
+          </span>
+        </div>
+      </header>
+
+      <section class="conversation" id="conversation" aria-live="polite">
+        <div class="empty-state" id="emptyState">
+          <div class="empty-logo">AI</div>
+          <span class="eyebrow">LOCAL DIAGNOSTICS</span>
+          <h1>What should I inspect?</h1>
+          <p>Ask about an app, deployment, database, repository, or recent warning. MiniAI retrieves only the evidence it needs and keeps all inference local on the Dell.</p>
+          <div class="prompt-grid">
+            <button class="prompt-card" data-prompt="Is MyScheduler healthy right now? Summarize only what matters.">
+              <strong>Check MyScheduler</strong>
+              <span>Deployment, database, Dell usage, recent activity</span>
+            </button>
+            <button class="prompt-card" data-prompt="Inspect the MyScheduler repository and explain where authentication is implemented. Cite the relevant source paths.">
+              <strong>Inspect authentication</strong>
+              <span>Search and read the repository with source evidence</span>
+            </button>
+            <button class="prompt-card" data-prompt="What recent ReactorLab warnings should I care about right now?">
+              <strong>Review warnings</strong>
+              <span>Check current infrastructure activity</span>
+            </button>
+            <button class="prompt-card" data-prompt="Check MyScheduler runtime logs for anything unusual. Only use logs if they are relevant.">
+              <strong>Inspect runtime logs</strong>
+              <span>Bounded, redacted MiniDeploy logs</span>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <div class="composer-wrap">
+        <div class="activity-line" id="activityLine" hidden>
+          <span class="spinner"></span>
+          <span id="activityText">MiniAI is working…</span>
+          <span class="elapsed" id="elapsed"></span>
+        </div>
+        <form class="composer" id="composer">
+          <textarea id="messageInput" rows="1" maxlength="12000" placeholder="Message MiniAI…" aria-label="Message MiniAI"></textarea>
+          <button class="send-button" id="sendButton" type="submit" aria-label="Send message">↑</button>
+        </form>
+        <div class="composer-meta">
+          <span>100% local · read-only</span>
+          <span id="modelHint">Model sleeps until you ask a question.</span>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>
