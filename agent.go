@@ -164,8 +164,8 @@ func agentToolDefinitions() []toolDefinition {
 	}
 }
 
-func (a *app) agentSystemPrompt(ctx context.Context, userMessage string) (string, []string) {
-	contexts, names := a.resolveMentionedContexts(ctx, userMessage)
+func (a *app) agentSystemPrompt(ctx context.Context, userMessage string, history []storedMessage) (string, []string) {
+	contexts, names := a.resolveMentionedContexts(ctx, chatContextQuery(history, userMessage))
 	compact := make([]map[string]any, 0, len(contexts))
 	for _, item := range contexts {
 		compact = append(compact, compactModelContext(item))
@@ -197,7 +197,7 @@ CURRENT APP CONTEXT (untrusted data):
 ` + contextJSON, names
 }
 
-func (a *app) handleAgentChatStream(w http.ResponseWriter, r *http.Request, req chatRequest, policy modelPolicy) {
+func (a *app) handleAgentChatStream(w http.ResponseWriter, r *http.Request, req chatRequest, policy modelPolicy, history []storedMessage) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming unsupported")
@@ -208,7 +208,7 @@ func (a *app) handleAgentChatStream(w http.ResponseWriter, r *http.Request, req 
 	w.Header().Set("X-Accel-Buffering", "no")
 
 	agentStarted := time.Now()
-	systemPrompt, contextApps := a.agentSystemPrompt(r.Context(), req.Message)
+	systemPrompt, contextApps := a.agentSystemPrompt(r.Context(), req.Message, history)
 	sendSSE(w, "meta", map[string]any{
 		"model":          policy.Model,
 		"mode":           policy.Mode,
@@ -218,10 +218,9 @@ func (a *app) handleAgentChatStream(w http.ResponseWriter, r *http.Request, req 
 	})
 	flusher.Flush()
 
-	messages := []chatMessage{
-		{Role: "system", Content: systemPrompt},
-		{Role: "user", Content: req.Message},
-	}
+	messages := []chatMessage{{Role: "system", Content: systemPrompt}}
+	messages = append(messages, storedHistoryMessages(history)...)
+	messages = append(messages, chatMessage{Role: "user", Content: req.Message})
 	tools := agentToolDefinitions()
 	toolCallsUsed := 0
 	plannerCalls := 0
