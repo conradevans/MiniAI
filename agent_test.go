@@ -187,6 +187,7 @@ func TestSimpleRepositoryLocationQuestionFastPath(t *testing.T) {
 	}{
 		{"Which backend route handles schedule templates in MyScheduler?", true},
 		{"Where is the login function defined in MyScheduler?", true},
+		{"Why is the schedule template route failing in MyScheduler?", false},
 		{"Why is the schedule route slow in MyScheduler?", false},
 		{"Debug the schedule endpoint failure in MyScheduler", false},
 		{"Check MyScheduler deployment logs for the route error", false},
@@ -260,5 +261,79 @@ func TestScanOllamaChatEmitsKeepaliveBetweenChunks(t *testing.T) {
 	}
 	if keepalives.Load() == 0 || content != "ok" {
 		t.Fatalf("keepalives=%d content=%q", keepalives.Load(), content)
+	}
+}
+
+func TestRepositoryLocationEvidenceIsBoundedAroundMatch(t *testing.T) {
+	lines := make([]string, 220)
+	for i := range lines {
+		lines[i] = "ordinary source line " + strings.Repeat("x", 120)
+	}
+	lines[109] = `router.get("/", scheduleTemplateHandler)`
+	file := repoFileResponse{
+		App: "myscheduler", Path: "backend/routes/scheduleTemplateRoutes.js",
+		Content: strings.Join(lines, "\n"), Redacted: true,
+	}
+	search := repoSearchResponse{Hits: []repoSearchHit{{
+		Path: file.Path, Line: 110, Text: lines[109],
+	}}}
+	evidence, ok := compactRepositoryLocationEvidence(search, file)
+	if !ok {
+		t.Fatal("expected compact evidence")
+	}
+	if evidence.StartLine != 102 || evidence.EndLine > 122 {
+		t.Fatalf("unexpected evidence window %d-%d", evidence.StartLine, evidence.EndLine)
+	}
+	if !strings.Contains(evidence.Snippet, `110: router.get("/", scheduleTemplateHandler)`) {
+		t.Fatalf("match missing from snippet: %q", evidence.Snippet)
+	}
+	if len([]rune(evidence.Snippet)) > agentEvidenceMaxRunesPerFile {
+		t.Fatalf("snippet has %d runes", len([]rune(evidence.Snippet)))
+	}
+	if len(evidence.Snippet) >= len(file.Content)/2 {
+		t.Fatalf("snippet was not substantially smaller: snippet=%d file=%d", len(evidence.Snippet), len(file.Content))
+	}
+	if !evidence.Redacted {
+		t.Fatal("redaction metadata was not preserved")
+	}
+}
+
+func TestRepositoryLocationSourcePathsPreferOneSufficientRouteFile(t *testing.T) {
+	search := repoSearchResponse{Hits: []repoSearchHit{
+		{Path: "backend/routes/scheduleTemplateRoutes.js", Line: 10, Text: `router.get("/", handler)`},
+		{Path: "backend/services/scheduleTemplates.js", Line: 20, Text: "schedule template"},
+	}}
+	got := repositoryLocationSourcePaths(search, map[string]bool{}, "schedule")
+	if len(got) != 1 || got[0] != "backend/routes/scheduleTemplateRoutes.js" {
+		t.Fatalf("paths=%v", got)
+	}
+}
+
+func TestRepositoryLocationSourcePathsIncludeRouteMountContext(t *testing.T) {
+	search := repoSearchResponse{Hits: []repoSearchHit{
+		{Path: "backend/routes/scheduleTemplateRoutes.js", Line: 10, Text: `router.get("/", handler)`},
+		{Path: "backend/app.js", Line: 6, Text: `app.use("/api/schedule-templates", scheduleTemplateRoutes)`},
+	}}
+	got := repositoryLocationSourcePaths(search, map[string]bool{}, "schedule")
+	if len(got) != 2 {
+		t.Fatalf("paths=%v want route and mount files", got)
+	}
+	if got[0] != "backend/routes/scheduleTemplateRoutes.js" || got[1] != "backend/app.js" {
+		t.Fatalf("paths=%v", got)
+	}
+}
+
+func TestRepositoryLocationPromptStaysSmall(t *testing.T) {
+	evidence := repositoryLocationEvidence{
+		Path: "backend/routes/scheduleTemplateRoutes.js", StartLine: 10, EndLine: 20,
+		Snippet: strings.Repeat("router.get('/', handler)\n", 11),
+	}
+	messages := repositoryLocationMessages(
+		"Which backend route handles schedule templates in MyScheduler?",
+		"myscheduler",
+		[]chatMessage{{Role: "tool", ToolName: "read_repository_file", Content: encodeAgentToolResult(evidence)}},
+	)
+	if runes := repositoryMessageRunes(messages); runes >= 4000 {
+		t.Fatalf("fast-path prompt too large: %d runes", runes)
 	}
 }

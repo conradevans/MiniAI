@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -13,13 +14,16 @@ import (
 )
 
 const (
-	agentMaxRounds            = 3
-	agentMaxToolCalls         = 6
-	agentToolResultMaxRunes   = 6000
-	agentSearchMaxHits        = 12
-	agentSearchMaxPerFile     = 2
-	agentEvidenceMaxFiles     = 2
-	agentSSEKeepaliveInterval = 15 * time.Second
+	agentMaxRounds               = 3
+	agentMaxToolCalls            = 6
+	agentToolResultMaxRunes      = 6000
+	agentSearchMaxHits           = 12
+	agentSearchMaxPerFile        = 2
+	agentEvidenceMaxFiles        = 2
+	agentEvidenceLinesBefore     = 8
+	agentEvidenceLinesAfter      = 12
+	agentEvidenceMaxRunesPerFile = 2400
+	agentSSEKeepaliveInterval    = 15 * time.Second
 )
 
 type chatMessage struct {
@@ -61,13 +65,23 @@ type chatAPIRequest struct {
 }
 
 type chatAPIResponse struct {
-	Message       chatMessage `json:"message"`
-	Done          bool        `json:"done"`
-	EvalCount     int         `json:"eval_count,omitempty"`
-	EvalDuration  int64       `json:"eval_duration,omitempty"`
-	LoadDuration  int64       `json:"load_duration,omitempty"`
-	TotalDuration int64       `json:"total_duration,omitempty"`
-	Error         string      `json:"error,omitempty"`
+	Message            chatMessage `json:"message"`
+	Done               bool        `json:"done"`
+	PromptEvalCount    int         `json:"prompt_eval_count,omitempty"`
+	PromptEvalDuration int64       `json:"prompt_eval_duration,omitempty"`
+	EvalCount          int         `json:"eval_count,omitempty"`
+	EvalDuration       int64       `json:"eval_duration,omitempty"`
+	LoadDuration       int64       `json:"load_duration,omitempty"`
+	TotalDuration      int64       `json:"total_duration,omitempty"`
+	Error              string      `json:"error,omitempty"`
+}
+
+type repositoryLocationEvidence struct {
+	Path      string `json:"path"`
+	StartLine int    `json:"start_line"`
+	EndLine   int    `json:"end_line"`
+	Snippet   string `json:"snippet"`
+	Redacted  bool   `json:"redacted,omitempty"`
 }
 
 type agentToolEvent struct {
@@ -229,7 +243,7 @@ func (a *app) handleAgentChatStream(w http.ResponseWriter, r *http.Request, req 
 	readPaths := map[string]bool{}
 	var plannerContent string
 	var plannerMetrics chatAPIResponse
-	fastEvidence := make([]chatMessage, 0, agentEvidenceMaxFiles+1)
+	fastEvidence := make([]chatMessage, 0, agentEvidenceMaxFiles)
 	sourceReads := 0
 
 	// Code-location questions must never terminate with a permission-seeking
@@ -252,12 +266,11 @@ func (a *app) handleAgentChatStream(w http.ResponseWriter, r *http.Request, req 
 			}
 			searchMessage := chatMessage{Role: "tool", ToolName: "search_repository", Content: encodeAgentToolResult(compactAgentToolResult("search_repository", result))}
 			messages = append(messages, searchMessage)
-			fastEvidence = append(fastEvidence, searchMessage)
 			sendSSE(w, "tool", agentToolEvent{Phase: "result", Name: "search_repository", Summary: summary + " (repository evidence floor)"})
 			flusher.Flush()
 
 			if search, ok := result.(repoSearchResponse); ok {
-				candidates := bestUnreadSourcePaths(search, readPaths, query, agentEvidenceMaxFiles)
+				candidates := repositoryLocationSourcePaths(search, readPaths, query)
 				for _, candidate := range candidates {
 					if toolCallsUsed >= agentMaxToolCalls {
 						break
@@ -272,12 +285,17 @@ func (a *app) handleAgentChatStream(w http.ResponseWriter, r *http.Request, req 
 						guardSummary = "tool failed: " + guardErr.Error()
 					} else {
 						readPaths[candidate] = true
-						sourceReads++
 					}
 					readMessage := chatMessage{Role: "tool", ToolName: "read_repository_file", Content: encodeAgentToolResult(compactAgentToolResult("read_repository_file", guardResult))}
 					messages = append(messages, readMessage)
-					if guardErr == nil {
-						fastEvidence = append(fastEvidence, readMessage)
+					if file, ok := guardResult.(repoFileResponse); ok {
+						if evidence, ok := compactRepositoryLocationEvidence(search, file); ok {
+							fastEvidence = append(fastEvidence, chatMessage{
+								Role: "tool", ToolName: "read_repository_file",
+								Content: encodeAgentToolResult(evidence),
+							})
+							sourceReads++
+						}
 					}
 					sendSSE(w, "tool", agentToolEvent{Phase: "result", Name: "read_repository_file", Summary: guardSummary + " (repository evidence floor)"})
 					flusher.Flush()
@@ -288,6 +306,8 @@ func (a *app) handleAgentChatStream(w http.ResponseWriter, r *http.Request, req 
 
 	if isSimpleRepositoryLocationQuestion(req.Message) && len(contextApps) == 1 && sourceReads > 0 {
 		fastMessages := repositoryLocationMessages(req.Message, contextApps[0], fastEvidence)
+		promptRunes := repositoryMessageRunes(fastMessages)
+		log.Printf("MiniAI repository fast path: app=%s evidence_files=%d prompt_runes=%d estimated_prompt_tokens=%d", contextApps[0], len(fastEvidence), promptRunes, (promptRunes+3)/4)
 		if err := a.streamAgentFinal(r.Context(), w, flusher, policy, fastMessages, toolCallsUsed, 0, agentStarted); err != nil {
 			sendSSE(w, "error", map[string]string{"error": err.Error()})
 			flusher.Flush()
@@ -532,6 +552,8 @@ func (a *app) streamAgentFinal(ctx context.Context, w io.Writer, flusher http.Fl
 		"tool_calls":        toolCallsUsed,
 		"planner_calls":     plannerCalls,
 		"agent_seconds":     round2(time.Since(agentStarted).Seconds()),
+		"prompt_tokens":     final.PromptEvalCount,
+		"prompt_seconds":    round2(float64(final.PromptEvalDuration) / 1e9),
 		"tokens":            final.EvalCount,
 		"tokens_per_second": round2(tps),
 		"load_seconds":      round2(float64(final.LoadDuration) / 1e9),
@@ -799,6 +821,85 @@ func bestUnreadSourcePaths(search repoSearchResponse, already map[string]bool, q
 		out = append(out, item.path)
 	}
 	return out
+}
+
+func repositoryLocationSourcePaths(search repoSearchResponse, already map[string]bool, query string) []string {
+	candidates := bestUnreadSourcePaths(search, already, query, agentSearchMaxHits)
+	if len(candidates) < 2 {
+		return candidates
+	}
+	out := candidates[:1]
+	for _, candidate := range candidates[1:] {
+		if repositoryPathProvidesMountContext(search, candidate) {
+			out = append(out, candidate)
+			break
+		}
+	}
+	return out
+}
+
+func repositoryPathProvidesMountContext(search repoSearchResponse, path string) bool {
+	lowerPath := strings.ToLower(path)
+	base := lowerPath
+	if slash := strings.LastIndex(base, "/"); slash >= 0 {
+		base = base[slash+1:]
+	}
+	if base != "app.js" && base != "app.ts" && base != "main.go" && base != "server.js" && base != "server.ts" {
+		return false
+	}
+	for _, hit := range search.Hits {
+		if hit.Path != path {
+			continue
+		}
+		text := strings.ToLower(hit.Text)
+		for _, marker := range []string{"app.use(", ".use(", "mount", "include_router", "register", "route("} {
+			if strings.Contains(text, marker) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func compactRepositoryLocationEvidence(search repoSearchResponse, file repoFileResponse) (repositoryLocationEvidence, bool) {
+	matchLine := 0
+	for _, hit := range search.Hits {
+		if hit.Path == file.Path && hit.Line > 0 {
+			matchLine = hit.Line
+			break
+		}
+	}
+	if matchLine == 0 {
+		return repositoryLocationEvidence{}, false
+	}
+	lines := strings.Split(file.Content, "\n")
+	start := matchLine - agentEvidenceLinesBefore
+	if start < 1 {
+		start = 1
+	}
+	end := matchLine + agentEvidenceLinesAfter
+	if end > len(lines) {
+		end = len(lines)
+	}
+	var snippet strings.Builder
+	for line := start; line <= end; line++ {
+		fmt.Fprintf(&snippet, "%d: %s\n", line, lines[line-1])
+	}
+	content := strings.TrimSuffix(snippet.String(), "\n")
+	content = truncateRunes(content, agentEvidenceMaxRunesPerFile-1)
+	actualEnd := start + strings.Count(content, "\n")
+	return repositoryLocationEvidence{
+		Path: file.Path, StartLine: start, EndLine: actualEnd,
+		Snippet: content, Redacted: file.Redacted,
+	}, true
+}
+
+func repositoryMessageRunes(messages []chatMessage) int {
+	total := 0
+	for _, message := range messages {
+		total += len([]rune(message.Content))
+	}
+	return total
 }
 
 func evidenceQueryTokens(query string) []string {
