@@ -146,6 +146,26 @@ func TestCompactAgentSearchResultLimitsHits(t *testing.T) {
 	}
 }
 
+func TestRepositorySeedQueryUsesDomainTerm(t *testing.T) {
+	got := repositorySeedQuery(
+		"Which backend route handles schedule templates in MyScheduler?",
+		[]string{"myscheduler"},
+	)
+	if got != "schedule" {
+		t.Fatalf("repositorySeedQuery=%q want schedule", got)
+	}
+}
+
+func TestRepositorySeedQuerySkipsGenericCodeWords(t *testing.T) {
+	got := repositorySeedQuery(
+		"Where is login auth implemented in MyScheduler?",
+		[]string{"myscheduler"},
+	)
+	if got != "login" {
+		t.Fatalf("repositorySeedQuery=%q want login", got)
+	}
+}
+
 func TestRequiresRepositoryEvidence(t *testing.T) {
 	if !requiresRepositoryEvidence("Which route file defines the endpoint?") {
 		t.Fatal("expected repository evidence requirement")

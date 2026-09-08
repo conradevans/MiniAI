@@ -229,6 +229,53 @@ func (a *app) handleAgentChatStream(w http.ResponseWriter, r *http.Request, req 
 	var plannerContent string
 	var plannerMetrics chatAPIResponse
 
+	// Code-location questions must never terminate with a permission-seeking
+	// answer such as "would you like me to search?". Seed one safe repository
+	// search when exactly one app is already resolved, then let Qwen reason over
+	// that evidence and choose any additional read-only tools it needs.
+	if requiresRepositoryEvidence(req.Message) && len(contextApps) == 1 {
+		query := repositorySeedQuery(req.Message, contextApps)
+		if query != "" && toolCallsUsed < agentMaxToolCalls {
+			args := map[string]any{"app": contextApps[0], "path": ".", "query": query}
+			usedAnyTool = true
+			toolCallsUsed++
+			sendSSE(w, "tool", agentToolEvent{Phase: "start", Name: "search_repository", Arguments: args, Summary: "repository evidence floor"})
+			flusher.Flush()
+
+			result, summary, err := a.executeAgentTool(r.Context(), "search_repository", args)
+			if err != nil {
+				result = map[string]any{"error": err.Error()}
+				summary = "tool failed: " + err.Error()
+			}
+			messages = append(messages, chatMessage{Role: "tool", ToolName: "search_repository", Content: encodeAgentToolResult(compactAgentToolResult("search_repository", result))})
+			sendSSE(w, "tool", agentToolEvent{Phase: "result", Name: "search_repository", Summary: summary + " (repository evidence floor)"})
+			flusher.Flush()
+
+			if search, ok := result.(repoSearchResponse); ok {
+				candidates := bestUnreadSourcePaths(search, readPaths, query, agentEvidenceMaxFiles)
+				for _, candidate := range candidates {
+					if toolCallsUsed >= agentMaxToolCalls {
+						break
+					}
+					toolCallsUsed++
+					guardArgs := map[string]any{"app": search.App, "path": candidate}
+					sendSSE(w, "tool", agentToolEvent{Phase: "start", Name: "read_repository_file", Arguments: guardArgs, Summary: "repository evidence floor"})
+					flusher.Flush()
+					guardResult, guardSummary, guardErr := a.executeAgentTool(r.Context(), "read_repository_file", guardArgs)
+					if guardErr != nil {
+						guardResult = map[string]any{"error": guardErr.Error()}
+						guardSummary = "tool failed: " + guardErr.Error()
+					} else {
+						readPaths[candidate] = true
+					}
+					messages = append(messages, chatMessage{Role: "tool", ToolName: "read_repository_file", Content: encodeAgentToolResult(compactAgentToolResult("read_repository_file", guardResult))})
+					sendSSE(w, "tool", agentToolEvent{Phase: "result", Name: "read_repository_file", Summary: guardSummary + " (repository evidence floor)"})
+					flusher.Flush()
+				}
+			}
+		}
+	}
+
 	for round := 0; round < agentMaxRounds && toolCallsUsed < agentMaxToolCalls; round++ {
 		plannerCalls++
 		planner, err := a.callAgentPlanner(r.Context(), policy.Model, messages, tools)
@@ -479,6 +526,41 @@ func emitBufferedAnswer(w io.Writer, flusher http.Flusher, content string) {
 		sendSSE(w, "token", map[string]string{"content": part})
 	}
 	flusher.Flush()
+}
+
+func repositorySeedQuery(message string, appNames []string) string {
+	m := strings.ToLower(message)
+	for _, appName := range appNames {
+		name := strings.ToLower(strings.TrimSpace(appName))
+		if name != "" {
+			m = strings.ReplaceAll(m, name, " ")
+		}
+	}
+
+	stop := map[string]bool{
+		"which": true, "what": true, "where": true, "when": true, "why": true, "how": true,
+		"the": true, "this": true, "that": true, "these": true, "those": true,
+		"is": true, "are": true, "was": true, "were": true, "be": true, "been": true,
+		"a": true, "an": true, "and": true, "or": true, "to": true, "for": true, "from": true,
+		"in": true, "on": true, "of": true, "with": true, "by": true, "my": true,
+		"backend": true, "frontend": true, "route": true, "routes": true, "endpoint": true, "endpoints": true,
+		"handler": true, "handlers": true, "module": true, "file": true, "files": true, "code": true, "source": true,
+		"implementation": true, "implemented": true, "define": true, "defines": true, "defined": true,
+		"handle": true, "handles": true, "handling": true, "inspect": true, "find": true, "show": true,
+		"application": true, "app": true, "repository": true, "repo": true,
+	}
+
+	parts := strings.FieldsFunc(m, func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'))
+	})
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if len(part) < 4 || stop[part] {
+			continue
+		}
+		return part
+	}
+	return ""
 }
 
 func requiresRepositoryEvidence(message string) bool {
