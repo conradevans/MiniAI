@@ -2,8 +2,13 @@ package main
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestShouldUseAgentTools(t *testing.T) {
@@ -172,5 +177,88 @@ func TestRequiresRepositoryEvidence(t *testing.T) {
 	}
 	if requiresRepositoryEvidence("Is MyScheduler healthy?") {
 		t.Fatal("unexpected repository evidence requirement")
+	}
+}
+
+func TestSimpleRepositoryLocationQuestionFastPath(t *testing.T) {
+	cases := []struct {
+		message string
+		want    bool
+	}{
+		{"Which backend route handles schedule templates in MyScheduler?", true},
+		{"Where is the login function defined in MyScheduler?", true},
+		{"Why is the schedule route slow in MyScheduler?", false},
+		{"Debug the schedule endpoint failure in MyScheduler", false},
+		{"Check MyScheduler deployment logs for the route error", false},
+		{"Which database query is slow in MyScheduler?", false},
+	}
+	for _, tc := range cases {
+		if got := isSimpleRepositoryLocationQuestion(tc.message); got != tc.want {
+			t.Errorf("isSimpleRepositoryLocationQuestion(%q)=%v want %v", tc.message, got, tc.want)
+		}
+	}
+}
+
+func TestRepositoryLocationMessagesAreCompactAndEvidenceOnly(t *testing.T) {
+	evidence := []chatMessage{
+		{Role: "tool", ToolName: "search_repository", Content: "{\"hits\":[{\"path\":\"backend/routes/schedule.js\",\"line\":8}]}"},
+		{Role: "tool", ToolName: "read_repository_file", Content: "{\"path\":\"backend/routes/schedule.js\",\"content\":\"router.get(...)\"}"},
+	}
+	got := repositoryLocationMessages("Which route handles schedules?", "myscheduler", evidence)
+	if len(got) != 4 {
+		t.Fatalf("messages=%d want 4", len(got))
+	}
+	if !strings.Contains(got[0].Content, "read-only evidence") || strings.Contains(got[0].Content, "CURRENT APP CONTEXT") {
+		t.Fatalf("unexpected fast-path system prompt: %q", got[0].Content)
+	}
+	if got[2].ToolName != "search_repository" || got[3].ToolName != "read_repository_file" {
+		t.Fatalf("evidence not preserved: %+v", got)
+	}
+}
+
+func TestDoOllamaRequestEmitsKeepaliveWhileWaiting(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(40 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, server.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var keepalives atomic.Int32
+	resp, err := doOllamaRequest(context.Background(), server.Client(), req, 5*time.Millisecond, func() {
+		keepalives.Add(1)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if keepalives.Load() == 0 {
+		t.Fatal("expected at least one keepalive while Ollama request was pending")
+	}
+}
+
+func TestScanOllamaChatEmitsKeepaliveBetweenChunks(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	go func() {
+		defer writer.Close()
+		time.Sleep(30 * time.Millisecond)
+		_, _ = writer.Write([]byte("{\"message\":{\"content\":\"ok\"},\"done\":true}\n"))
+	}()
+	var keepalives atomic.Int32
+	var content string
+	err := scanOllamaChat(context.Background(), reader, 5*time.Millisecond, func() {
+		keepalives.Add(1)
+	}, func(chunk chatAPIResponse) error {
+		content += chunk.Message.Content
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keepalives.Load() == 0 || content != "ok" {
+		t.Fatalf("keepalives=%d content=%q", keepalives.Load(), content)
 	}
 }
