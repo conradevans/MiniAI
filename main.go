@@ -44,6 +44,9 @@ type app struct {
 
 	mu       sync.Mutex
 	sessions map[string]*session
+
+	repoIndexMu sync.Mutex
+	repoIndexes map[string]repositoryIndexCache
 }
 
 type session struct {
@@ -453,25 +456,6 @@ func (a *app) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	}
 	defer a.finishChat(req.SessionID)
 
-	sys, err := readSystemStatus()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	oll := a.getOllamaStatus(r.Context())
-	if !oll.Reachable {
-		writeError(w, http.StatusServiceUnavailable, "ollama is unavailable")
-		return
-	}
-	policy := choosePolicy(sys, oll.LoadedModels)
-	if !policy.Allowed {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"error":  "MiniAI will not load a model while the Dell is under resource pressure",
-			"policy": policy,
-		})
-		return
-	}
-
 	var history []storedMessage
 	var capture *sseCaptureWriter
 	if req.ChatID != "" {
@@ -502,6 +486,29 @@ func (a *app) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}()
+	}
+
+	if a.handleDeterministicRepositoryLookup(w, r, req.Message) {
+		return
+	}
+
+	sys, err := readSystemStatus()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	oll := a.getOllamaStatus(r.Context())
+	if !oll.Reachable {
+		writeError(w, http.StatusServiceUnavailable, "ollama is unavailable")
+		return
+	}
+	policy := choosePolicy(sys, oll.LoadedModels)
+	if !policy.Allowed {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error":  "MiniAI will not load a model while the Dell is under resource pressure",
+			"policy": policy,
+		})
+		return
 	}
 
 	if shouldUseAgentTools(req.Message) {

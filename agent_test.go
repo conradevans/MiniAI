@@ -187,6 +187,7 @@ func TestSimpleRepositoryLocationQuestionFastPath(t *testing.T) {
 	}{
 		{"Which backend route handles schedule templates in MyScheduler?", true},
 		{"Where is the login function defined in MyScheduler?", true},
+		{"Where is FooBar defined in MyScheduler?", true},
 		{"Why is the schedule template route failing in MyScheduler?", false},
 		{"Why is the schedule route slow in MyScheduler?", false},
 		{"Debug the schedule endpoint failure in MyScheduler", false},
