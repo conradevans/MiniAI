@@ -491,6 +491,9 @@ func (a *app) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	if a.handleDeterministicRepositoryLookup(w, r, req.Message) {
 		return
 	}
+	if a.handleDeterministicDiagnosticLookup(w, r, req.Message) {
+		return
+	}
 
 	sys, err := readSystemStatus()
 	if err != nil {
@@ -511,6 +514,9 @@ func (a *app) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if a.handleCuratedDiagnosticStream(w, r, req.Message, policy) {
+		return
+	}
 	if shouldUseAgentTools(req.Message) {
 		a.handleAgentChatStream(w, r, req, policy, history)
 		return

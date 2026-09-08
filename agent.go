@@ -490,6 +490,10 @@ func (a *app) callAgentPlannerWithKeepalive(ctx context.Context, model string, m
 }
 
 func (a *app) streamAgentFinal(ctx context.Context, w io.Writer, flusher http.Flusher, policy modelPolicy, messages []chatMessage, toolCallsUsed, plannerCalls int, agentStarted time.Time) error {
+	return a.streamAgentFinalWithLimit(ctx, w, flusher, policy, messages, toolCallsUsed, plannerCalls, agentStarted, 768)
+}
+
+func (a *app) streamAgentFinalWithLimit(ctx context.Context, w io.Writer, flusher http.Flusher, policy modelPolicy, messages []chatMessage, toolCallsUsed, plannerCalls int, agentStarted time.Time, numPredict int) error {
 	reqBody := chatAPIRequest{
 		Model:     policy.Model,
 		Messages:  messages,
@@ -498,7 +502,7 @@ func (a *app) streamAgentFinal(ctx context.Context, w io.Writer, flusher http.Fl
 		KeepAlive: modelKeepAlive,
 		Options: map[string]any{
 			"num_ctx":     8192,
-			"num_predict": 768,
+			"num_predict": numPredict,
 		},
 	}
 	body, err := json.Marshal(reqBody)
@@ -549,6 +553,8 @@ func (a *app) streamAgentFinal(ctx context.Context, w io.Writer, flusher http.Fl
 		"model":             policy.Model,
 		"mode":              policy.Mode,
 		"agent":             true,
+		"answer_mode":       "agent",
+		"model_invoked":     true,
 		"tool_calls":        toolCallsUsed,
 		"planner_calls":     plannerCalls,
 		"agent_seconds":     round2(time.Since(agentStarted).Seconds()),
