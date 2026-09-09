@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -215,6 +216,53 @@ func TestRepositoryLocationMessagesAreCompactAndEvidenceOnly(t *testing.T) {
 	}
 	if got[2].ToolName != "search_repository" || got[3].ToolName != "read_repository_file" {
 		t.Fatalf("evidence not preserved: %+v", got)
+	}
+}
+
+func TestMiniAIOllamaRequestsUseImmediateUnload(t *testing.T) {
+	requests := []chatAPIRequest{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request chatAPIRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		requests = append(requests, request)
+		_ = json.NewEncoder(w).Encode(chatAPIResponse{Message: chatMessage{Content: "ok"}, Done: true})
+	}))
+	defer server.Close()
+	ultraCool, _ := parse8BInferenceProfile(inferenceProfileUltraCool)
+	a := &app{ollamaURL: server.URL, client: server.Client(), eightBProfile: ultraCool}
+	if _, err := a.callAgentPlanner(context.Background(), primaryModel, []chatMessage{{Role: "user", Content: "test"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	if err := a.streamAgentFinalWithLimit(context.Background(), recorder, recorder, modelPolicy{Model: primaryModel, Mode: "primary"},
+		[]chatMessage{{Role: "user", Content: "test"}}, 0, 0, time.Now(), 16); err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("requests=%d want planner and final", len(requests))
+	}
+	for index, request := range requests {
+		if request.KeepAlive == nil || number(request.KeepAlive) != 0 {
+			t.Fatalf("request %d keep_alive=%v want 0", index, request.KeepAlive)
+		}
+		if int(number(request.Options["num_thread"])) != 3 || int(number(request.Options["num_batch"])) != 32 {
+			t.Fatalf("request %d ultra_cool profile options=%v", index, request.Options)
+		}
+	}
+
+	encoded, err := json.Marshal(generateRequest{Model: primaryModel, Stream: true, KeepAlive: modelKeepAlive})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var generated map[string]any
+	if err := json.Unmarshal(encoded, &generated); err != nil {
+		t.Fatal(err)
+	}
+	if value, ok := generated["keep_alive"]; !ok || number(value) != 0 {
+		t.Fatalf("generate keep_alive missing or nonzero: %s", encoded)
 	}
 }
 

@@ -1,15 +1,27 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
+
+const liveComparisonDiagnosticQuery = "Investigate whether MyScheduler has any hidden issues by comparing its current service health, database state, and recent runtime logs. If anything looks concerning, explain what and why."
+
+func diagnosticResponseJSON(t *testing.T, response diagnosticFinalResponse) string {
+	t.Helper()
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(encoded)
+}
 
 func newDiagnosticTestApp(t *testing.T, deployments []any, services []any, runtimeLogs, deploymentLogs string) (*app, func()) {
 	t.Helper()
@@ -130,6 +142,36 @@ func TestDeterministicDiagnosticPrecedesOllamaChecks(t *testing.T) {
 	a.handleChatStream(recorder, req)
 	if modelCalls != 0 || !strings.Contains(recorder.Body.String(), `"model_invoked":false`) {
 		t.Fatalf("model_calls=%d stream=%s", modelCalls, recorder.Body.String())
+	}
+}
+
+func TestCleanVerificationPrecedesOllamaChecks(t *testing.T) {
+	logs := `172.20.0.1 - - [08/Sep/2026:19:43:55 +0000] "GET /health HTTP/1.1" 200 42 "-" "client/2.0" "-"`
+	a, cleanup := newDiagnosticTestApp(t, []any{healthyMySchedulerDeployment()}, nil, logs, "")
+	defer cleanup()
+	ollamaCalls := 0
+	ollama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ollamaCalls++
+		http.Error(w, "unexpected Ollama request", http.StatusInternalServerError)
+	}))
+	defer ollama.Close()
+	a.ollamaURL = ollama.URL
+	a.sessions = map[string]*session{
+		"verification-session": {
+			ID:            "verification-session",
+			CreatedAt:     time.Now(),
+			LastHeartbeat: time.Now(),
+			LastChat:      time.Now(),
+		},
+	}
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat/stream", strings.NewReader(
+		`{"session_id":"verification-session","message":"Is MyScheduler okay?"}`,
+	))
+	a.handleChatStream(recorder, req)
+	if ollamaCalls != 0 || !strings.Contains(recorder.Body.String(), `"model_invoked":false`) ||
+		!strings.Contains(recorder.Body.String(), `"diagnostic_confidence":"strongly_supported"`) {
+		t.Fatalf("ollama_calls=%d stream=%s", ollamaCalls, recorder.Body.String())
 	}
 }
 
@@ -265,6 +307,7 @@ func TestOversizedDiagnosticPacketHasHardBoundAndKeepsCoreFacts(t *testing.T) {
 		}
 	}
 	packet := diagnosticEvidencePacket{
+		UserReportedSymptom: huge,
 		Application: appDiagnosticSnapshot{
 			App: "myscheduler", DeploymentState: "failing", Services: services, AllServicesRunning: &running,
 			Health: "unhealthy", HealthSource: huge, DeployedCommit: "abc123", RepositoryCommit: "def456",
@@ -274,6 +317,15 @@ func TestOversizedDiagnosticPacketHasHardBoundAndKeepsCoreFacts(t *testing.T) {
 			Kind: "runtime", LinesExamined: 160, ErrorCount: 84, WarningCount: 7,
 			FirstErrorTimestamp: "2026-09-08T14:32:10Z", LastErrorTimestamp: "2026-09-08T14:37:52Z",
 			HTTPStatusCounts: map[string]int{"500": 84, "503": 2, huge: 99}, Patterns: patterns,
+		},
+		Repository: []repositoryLocationEvidence{{Path: huge, StartLine: 1, EndLine: 20, Snippet: huge}},
+		Investigation: diagnosticInvestigationSummary{
+			Rounds: 99, EvidenceExpansions: []string{huge, huge, huge, huge}, BudgetExhausted: true,
+		},
+		Assessment: diagnosticEvidenceAssessment{
+			Status: "unhealthy", ConfidenceCeiling: "strongly_supported",
+			Working: []string{huge, huge, huge, huge, huge}, Failing: []string{huge, huge, huge, huge, huge},
+			KeyEvidence: []string{huge, huge, huge, huge, huge}, Unknowns: []string{huge, huge, huge, huge, huge},
 		},
 		Unavailable: []string{huge},
 	}
@@ -293,6 +345,11 @@ func TestOversizedDiagnosticPacketHasHardBoundAndKeepsCoreFacts(t *testing.T) {
 		decoded.Application.Health != "unhealthy" || decoded.Application.VersionMismatch == nil || !*decoded.Application.VersionMismatch ||
 		decoded.Application.DeployedCommit != "abc123" || decoded.Application.RepositoryCommit != "def456" {
 		t.Fatalf("important application facts were lost: %+v", decoded.Application)
+	}
+	if decoded.Assessment.Status != "unhealthy" || decoded.Assessment.ConfidenceCeiling != "strongly_supported" ||
+		decoded.UserReportedSymptom == "" || len([]rune(decoded.UserReportedSymptom)) > diagnosticAssessmentItemMaxRunes ||
+		decoded.Investigation.Rounds > diagnosticMaxEvidenceExpansionRounds || len(decoded.Investigation.EvidenceExpansions) > diagnosticMaxEvidenceExpansionRounds {
+		t.Fatalf("important controller facts were lost or unbounded: assessment=%+v investigation=%+v", decoded.Assessment, decoded.Investigation)
 	}
 	if len(decoded.Application.Services) == 0 || decoded.Application.Services[0].State != "running" ||
 		decoded.RuntimeLogs == nil || decoded.RuntimeLogs.ErrorCount != 84 ||
@@ -352,9 +409,18 @@ func TestDiagnosticOutputBudget(t *testing.T) {
 		{name: "simple meaning", message: "What does this error mean?", want: diagnosticOutputSimple},
 		{name: "simple interpretation", message: "Should I worry about this status?", want: diagnosticOutputSimple},
 		{name: "normal diagnosis", message: "Why is MyScheduler failing?", want: diagnosticOutputNormal},
-		{name: "comparison", message: "Is this a database issue or backend issue, and why?", want: diagnosticOutputCompare},
-		{name: "explicit comparison", message: "Compare the deployment state and runtime errors.", want: diagnosticOutputCompare},
+		{name: "comparison by alternatives", message: "Is this a database issue or backend issue, and why?", want: diagnosticOutputCompare},
+		{name: "compare", message: "Compare the deployment state and runtime errors.", want: diagnosticOutputCompare},
+		{name: "comparing live query", message: liveComparisonDiagnosticQuery, want: diagnosticOutputCompare},
+		{name: "compared", message: "How does the backend look compared with the database?", want: diagnosticOutputCompare},
+		{name: "comparison noun", message: "Give a comparison of service health and recent logs.", want: diagnosticOutputCompare},
+		{name: "contrast", message: "Contrast current health with deployment errors.", want: diagnosticOutputCompare},
+		{name: "contrasting", message: "Diagnose this by contrasting frontend and backend state.", want: diagnosticOutputCompare},
+		{name: "versus", message: "Backend versus database: which looks unhealthy?", want: diagnosticOutputCompare},
+		{name: "vs", message: "Backend vs. database: which is failing?", want: diagnosticOutputCompare},
+		{name: "between and", message: "What differs between the frontend and backend?", want: diagnosticOutputCompare},
 		{name: "deep root cause", message: "Analyze everything available and determine the most likely root cause.", want: diagnosticOutputDeep},
+		{name: "deep overrides comparison", message: "Compare every signal and determine the most likely root cause.", want: diagnosticOutputDeep},
 		{name: "deep correlation", message: "Correlate deployment timing, errors, service state, and repository state.", want: diagnosticOutputDeep},
 		{name: "deep multistep", message: "Explain what changed, why it broke, and what I should investigate next.", want: diagnosticOutputDeep},
 		{name: "ambiguous default", message: "Please take a closer look.", want: diagnosticOutputNormal},
@@ -372,6 +438,45 @@ func TestDiagnosticOutputBudget(t *testing.T) {
 	}
 }
 
+func TestCleanHiddenIssueInvestigationIsDeterministic(t *testing.T) {
+	logs := `172.20.0.1 - - [08/Sep/2026:19:43:55 +0000] "GET /health HTTP/1.1" 200 42 "-" "client/2.0" "-"`
+	a, cleanup := newDiagnosticTestApp(t, []any{healthyMySchedulerDeployment()}, nil, logs, "")
+	defer cleanup()
+	modelCalls := 0
+	ollama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		modelCalls++
+		http.Error(w, "unexpected Ollama request", http.StatusInternalServerError)
+	}))
+	defer ollama.Close()
+	a.ollamaURL = ollama.URL
+
+	recorder := httptest.NewRecorder()
+	capture := newSSECaptureWriter(recorder)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat/stream", nil)
+	policy := modelPolicy{Allowed: true, Model: primaryModel, Mode: "primary"}
+	if !a.handleCuratedDiagnosticStream(capture, req, liveComparisonDiagnosticQuery, policy) {
+		t.Fatal("expected investigated diagnostic path")
+	}
+	if modelCalls != 0 {
+		t.Fatalf("model_calls=%d want 0", modelCalls)
+	}
+	answer := strings.ToLower(capture.answer.String())
+	if !strings.Contains(answer, "didn't find evidence of a current issue") ||
+		!strings.Contains(answer, "confidence:** strongly supported") ||
+		!strings.Contains(answer, "bounded recent runtime log lines contain no detected errors") {
+		t.Fatalf("answer=%q", capture.answer.String())
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"answer_mode":"deterministic"`) ||
+		!strings.Contains(body, `"model_invoked":false`) ||
+		!strings.Contains(body, `"diagnostic_confidence":"strongly_supported"`) {
+		t.Fatalf("deterministic metadata missing: %s", body)
+	}
+	if len(capture.evidence) != 2 || capture.evidence[1].ToolName != "read_runtime_logs" {
+		t.Fatalf("evidence=%+v", capture.evidence)
+	}
+}
+
 func TestCausalDiagnosticUsesCuratedToolFreePacket(t *testing.T) {
 	var rawLogs strings.Builder
 	for i := 0; i < 100; i++ {
@@ -379,59 +484,313 @@ func TestCausalDiagnosticUsesCuratedToolFreePacket(t *testing.T) {
 	}
 	a, cleanup := newDiagnosticTestApp(t, []any{healthyMySchedulerDeployment()}, nil, rawLogs.String(), "")
 	defer cleanup()
-	var mu sync.Mutex
 	var received chatAPIRequest
+	events := []string{}
 	ollama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
+		events = append(events, "model")
 		_ = json.NewDecoder(r.Body).Decode(&received)
-		mu.Unlock()
-		_, _ = w.Write([]byte("{\"message\":{\"content\":\"The repeated timeouts are relevant evidence.\"},\"done\":true,\"prompt_eval_count\":300}\n"))
+		_ = json.NewEncoder(w).Encode(chatAPIResponse{
+			Message: chatMessage{Content: diagnosticResponseJSON(t, diagnosticFinalResponse{
+				Status: "degraded", Confidence: "plausible",
+				Conclusion:     "Repeated database timeouts are present, but the root cause is not established.",
+				PossibleCauses: []string{"An intermittent database path problem."},
+			})},
+			Done: true, PromptEvalCount: 300, EvalCount: 24, EvalDuration: int64(time.Second),
+		})
 	}))
 	defer ollama.Close()
 	a.ollamaURL = ollama.URL
+	runner := &fakePowerHelperRunner{handler: func(_ context.Context, command powerHelperCommand) (powerHelperResult, error) {
+		events = append(events, string(command))
+		if command == powerHelperEnter {
+			return powerHelperEntered, nil
+		}
+		return powerHelperRestored, nil
+	}}
+	a.powerLeaseManager = newCPUPowerLeaseManager(runner, nil)
 
 	recorder := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat/stream", nil)
 	policy := modelPolicy{Allowed: true, Model: primaryModel, Mode: "primary"}
-	if !a.handleCuratedDiagnosticStream(recorder, req, "Why is MyScheduler returning 500?", policy) {
-		t.Fatal("expected curated diagnostic path")
+	ran, leaseErr := a.with8BPowerLease(req.Context(), policy.Model, func() error {
+		if !a.handleCuratedDiagnosticStream(recorder, req, "Why is MyScheduler returning 500?", policy) {
+			t.Fatal("expected curated diagnostic path")
+		}
+		return nil
+	})
+	if !ran || leaseErr != nil {
+		t.Fatalf("curated lease ran=%v err=%v", ran, leaseErr)
 	}
-	mu.Lock()
-	got := received
-	mu.Unlock()
-	if len(got.Tools) != 0 || len(got.Messages) != 3 {
-		t.Fatalf("tools=%d messages=%d request=%+v", len(got.Tools), len(got.Messages), got)
+	if !reflect.DeepEqual(events, []string{"enter", "model", "restore"}) {
+		t.Fatalf("curated lease sequence=%v", events)
 	}
-	if int(number(got.Options["num_predict"])) != diagnosticOutputNormal {
-		t.Fatalf("num_predict=%v want %d", got.Options["num_predict"], diagnosticOutputNormal)
+	if len(received.Tools) != 0 || len(received.Messages) != 3 {
+		t.Fatalf("tools=%d messages=%d request=%+v", len(received.Tools), len(received.Messages), received)
 	}
-	prompt := got.Messages[0].Content
-	if !strings.Contains(prompt, "Challenge unsupported premises") ||
-		!strings.Contains(prompt, "Mandatory output contract") ||
-		!strings.Contains(prompt, "Never output planning, analysis narration, or meta-commentary") ||
-		!strings.Contains(prompt, "Do not mention the evidence packet, prompt, or instructions") {
-		t.Fatalf("curated final-answer instructions missing: %q", prompt)
+	if int(number(received.Options["num_predict"])) != diagnosticOutputNormal {
+		t.Fatalf("num_predict=%v want %d", received.Options["num_predict"], diagnosticOutputNormal)
 	}
-	packet := got.Messages[2].Content
+	if int(number(received.Options["num_thread"])) != 4 || int(number(received.Options["num_batch"])) != 64 {
+		t.Fatalf("cool profile options missing: %v", received.Options)
+	}
+	if number(received.Options["temperature"]) != 0 || received.Format == nil || received.KeepAlive == nil || number(received.KeepAlive) != 0 {
+		t.Fatalf("structured deterministic options or keep_alive missing: %+v", received)
+	}
+	format, ok := received.Format.(map[string]any)
+	if !ok || format["type"] != "object" || format["additionalProperties"] != false {
+		t.Fatalf("structured format missing: %#v", received.Format)
+	}
+	prompt := received.Messages[0].Content
+	if !strings.Contains(prompt, "Return only one JSON object") ||
+		!strings.Contains(prompt, "Do not add fields outside the schema") ||
+		!strings.Contains(prompt, "Never exceed the confidence_ceiling") ||
+		!strings.Contains(prompt, "Timing alone is not causation") {
+		t.Fatalf("curated structured-output instructions missing: %q", prompt)
+	}
+	packet := received.Messages[2].Content
 	var evidence diagnosticEvidencePacket
 	if err := json.Unmarshal([]byte(packet), &evidence); err != nil {
 		t.Fatalf("decode packet: %v", err)
 	}
 	if len([]rune(packet)) > diagnosticPacketMaxRunes || evidence.RuntimeLogs == nil ||
 		len(evidence.RuntimeLogs.Patterns) != 1 || evidence.RuntimeLogs.Patterns[0].Occurrences != 100 ||
-		evidence.RuntimeLogs.LinesSent != 1 {
-		t.Fatalf("packet was not compact: runes=%d evidence=%+v", len([]rune(packet)), evidence)
+		evidence.RuntimeLogs.LinesSent != 1 || evidence.Assessment.ConfidenceCeiling != "plausible" {
+		t.Fatalf("packet was not compact or assessed: runes=%d evidence=%+v", len([]rune(packet)), evidence)
 	}
 	body := recorder.Body.String()
 	if !strings.Contains(body, `"answer_mode":"agent"`) || !strings.Contains(body, `"model_invoked":true`) ||
-		!strings.Contains(body, `"planner_calls":0`) {
-		t.Fatalf("execution metadata missing: %s", body)
+		!strings.Contains(body, `"planner_calls":0`) || !strings.Contains(body, "Repeated database timeouts are present") ||
+		!strings.Contains(body, `"diagnostic_confidence":"plausible"`) ||
+		!strings.Contains(body, `"inference_profile":"cool"`) || !strings.Contains(body, `"num_thread":4`) ||
+		!strings.Contains(body, `"num_batch":64`) || !strings.Contains(body, `"cpu_power_limited":true`) ||
+		!strings.Contains(body, `"cpu_power_profile":"3ghz_power"`) {
+		t.Fatalf("execution metadata or rendered answer missing: %s", body)
+	}
+	if strings.Contains(body, `"status":"degraded"`) || strings.Contains(body, `"possible_causes"`) {
+		t.Fatalf("raw structured model output leaked: %s", body)
 	}
 }
 
-func TestHealthyCausalDiagnosticBypassesModelAndRetainsEvidence(t *testing.T) {
+func TestParseDiagnosticFinalResponse(t *testing.T) {
+	assessment := diagnosticEvidenceAssessment{
+		Status: "degraded", ConfidenceCeiling: "plausible",
+		Working:  []string{"The backend process is running."},
+		Failing:  []string{"Runtime logs contain HTTP 500 responses."},
+		RuledOut: []string{"A complete process outage."},
+	}
+	valid := diagnosticResponseJSON(t, diagnosticFinalResponse{
+		Status: "degraded", Confidence: "confirmed", Conclusion: "The request path is failing.",
+		Working:        []string{"unsupported model working claim"},
+		PossibleCauses: []string{"A route-level failure."},
+	})
+	parsed, err := parseDiagnosticFinalResponse(valid, assessment, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Confidence != "plausible" || len(parsed.Working) != 1 || parsed.Working[0] != assessment.Working[0] ||
+		len(parsed.RuledOut) != 1 || parsed.NextCheck != "" {
+		t.Fatalf("structured response was not evidence-bounded: %+v", parsed)
+	}
+
+	invalid := []string{
+		`{"status":"degraded","confidence":"certain","conclusion":"bad"}`,
+		`{"status":"degraded","confidence":"unknown","conclusion":""}`,
+		`{"status":"degraded","confidence":"unknown","conclusion":"bad","analysis":"hidden"}`,
+		`We are given evidence. {"status":"degraded","confidence":"unknown","conclusion":"bad"}`,
+	}
+	for _, raw := range invalid {
+		if response, err := parseDiagnosticFinalResponse(raw, assessment, false); err == nil {
+			t.Fatalf("invalid response accepted: %+v from %q", response, raw)
+		}
+	}
+	for _, field := range []string{"reasoning", "thought", "chain_of_thought", "plan", "analysis", "instructions", "prompt", "evidence_packet"} {
+		raw := fmt.Sprintf(`{"status":"degraded","confidence":"unknown","conclusion":"safe",%q:"hidden"}`, field)
+		if response, err := parseDiagnosticFinalResponse(raw, assessment, false); err == nil {
+			t.Fatalf("forbidden field %q accepted: %+v", field, response)
+		}
+	}
+	causal := `{"status":"degraded","confidence":"plausible","conclusion":"The outage was caused by the database."}`
+	if response, err := parseDiagnosticFinalResponse(causal, assessment, false); err == nil {
+		t.Fatalf("unsupported causal certainty accepted: %+v", response)
+	}
+	confirmedAssessment := assessment
+	confirmedAssessment.ConfidenceCeiling = "confirmed"
+	confirmed := `{"status":"degraded","confidence":"confirmed","conclusion":"The request failed because it was caused by the explicit configuration mismatch."}`
+	if _, err := parseDiagnosticFinalResponse(confirmed, confirmedAssessment, false); err != nil {
+		t.Fatalf("confirmed causal response rejected: %v", err)
+	}
+}
+
+func TestDiagnosticFinalResponseBoundsAndRendering(t *testing.T) {
+	long := strings.Repeat("detail-", 100)
+	assessment := diagnosticEvidenceAssessment{
+		Status: "unhealthy", ConfidenceCeiling: "unknown",
+		Working:  []string{"The service process is running."},
+		Failing:  []string{"The health endpoint is failing."},
+		RuledOut: []string{"A complete process outage."},
+		Unknowns: []string{"The root cause is not established."},
+	}
+	raw := diagnosticResponseJSON(t, diagnosticFinalResponse{
+		Status: "unhealthy", Confidence: "unknown", Conclusion: "MiniBase is unhealthy, but the root cause is unknown.",
+		PossibleCauses: []string{long, "two", "three", "four", "five"},
+		NextCheck:      strings.Repeat("next ", 200),
+	})
+	parsed, err := parseDiagnosticFinalResponse(raw, assessment, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.PossibleCauses) != diagnosticAssessmentMaxItems ||
+		len([]rune(parsed.PossibleCauses[0])) > diagnosticAssessmentItemMaxRunes ||
+		len([]rune(parsed.NextCheck)) > diagnosticNextCheckMaxRunes {
+		t.Fatalf("response bounds failed: %+v", parsed)
+	}
+	rendered := renderDiagnosticFinalResponse(parsed)
+	for _, expected := range []string{"MiniBase is unhealthy", "**Confidence:** Unknown", "### What is working", "### What is failing", "### What this rules out", "### What remains possible", "### What remains unknown", "### Next useful check"} {
+		if !strings.Contains(rendered, expected) {
+			t.Fatalf("rendered response missing %q: %s", expected, rendered)
+		}
+	}
+	clear := renderDiagnosticFinalResponse(diagnosticFinalResponse{Conclusion: "The issue is confirmed.", Confidence: "confirmed"})
+	if strings.Contains(clear, "###") {
+		t.Fatalf("clear diagnosis rendered empty sections: %s", clear)
+	}
+}
+
+func TestCuratedDiagnosticInvalidStructuredOutputUsesSafeFallback(t *testing.T) {
+	logs := `172.20.0.1 - - [08/Sep/2026:19:43:55 +0000] "GET /api/schedules HTTP/1.1" 500 567 "-" "client/2.0" "-"`
+	a, cleanup := newDiagnosticTestApp(t, []any{healthyMySchedulerDeployment()}, nil, logs, "")
+	defer cleanup()
+	ollama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(chatAPIResponse{
+			Message: chatMessage{Content: `We are given evidence. {"status":"degraded","confidence":"plausible","conclusion":"hidden"}`},
+			Done:    true, PromptEvalCount: 210, EvalCount: 18, EvalDuration: int64(time.Second),
+		})
+	}))
+	defer ollama.Close()
+	a.ollamaURL = ollama.URL
+
+	recorder := httptest.NewRecorder()
+	capture := newSSECaptureWriter(recorder)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat/stream", nil)
+	policy := modelPolicy{Allowed: true, Model: primaryModel, Mode: "primary"}
+	if !a.handleCuratedDiagnosticStream(capture, req, "Why is MyScheduler returning 500?", policy) {
+		t.Fatal("expected curated diagnostic path")
+	}
+	if capture.answer.String() != curatedDiagnosticFormatFailureMessage {
+		t.Fatalf("answer=%q want safe fallback", capture.answer.String())
+	}
+	body := recorder.Body.String()
+	if strings.Contains(body, "We are given") || strings.Contains(body, `"conclusion":"hidden"`) {
+		t.Fatalf("unsafe model output leaked: %s", body)
+	}
+	if !strings.Contains(body, `"model_invoked":true`) || !strings.Contains(body, `"planner_calls":0`) ||
+		!strings.Contains(body, `"prompt_tokens":210`) || !strings.Contains(body, `"generated_tokens":18`) ||
+		!strings.Contains(body, `"diagnostic_confidence":"unknown"`) {
+		t.Fatalf("curated metrics missing: %s", body)
+	}
+	if len(capture.evidence) != 2 {
+		t.Fatalf("evidence=%+v", capture.evidence)
+	}
+}
+
+func TestCleanOkayVerificationBypassesModelAndRetainsEvidence(t *testing.T) {
 	logs := `172.20.0.1 - - [08/Sep/2026:19:43:55 +0000] "GET / HTTP/1.1" 200 567 "-" "Go-http-client/1.1" "-"`
 	a, cleanup := newDiagnosticTestApp(t, []any{healthyMySchedulerDeployment()}, nil, logs, "")
+	defer cleanup()
+	modelCalls := 0
+	ollama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		modelCalls++
+		http.Error(w, "unexpected Ollama request", http.StatusInternalServerError)
+	}))
+	defer ollama.Close()
+	a.ollamaURL = ollama.URL
+
+	recorder := httptest.NewRecorder()
+	capture := newSSECaptureWriter(recorder)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat/stream", nil)
+	policy := modelPolicy{Allowed: true, Model: primaryModel, Mode: "primary"}
+	if !a.handleCuratedDiagnosticStream(capture, req, "Is MyScheduler okay?", policy) {
+		t.Fatal("expected diagnostic verification path")
+	}
+	if modelCalls != 0 {
+		t.Fatalf("model_calls=%d want 0", modelCalls)
+	}
+	answer := strings.ToLower(capture.answer.String())
+	if !strings.Contains(answer, "didn't find evidence of a current issue") ||
+		!strings.Contains(answer, "confidence:** strongly supported") ||
+		!strings.Contains(answer, "bounded recent runtime log lines contain no detected errors") {
+		t.Fatalf("answer=%q", capture.answer.String())
+	}
+	if len(capture.evidence) != 2 || capture.evidence[0].ToolName != "get_app_context" ||
+		capture.evidence[1].ToolName != "read_runtime_logs" {
+		t.Fatalf("evidence=%+v", capture.evidence)
+	}
+}
+
+func TestHealthyFailurePremiseUsesOneCuratedPass(t *testing.T) {
+	logs := `172.20.0.1 - - [08/Sep/2026:19:43:55 +0000] "GET / HTTP/1.1" 200 567 "-" "Go-http-client/1.1" "-"`
+	a, cleanup := newDiagnosticTestApp(t, []any{healthyMySchedulerDeployment()}, nil, logs, "")
+	defer cleanup()
+	modelCalls := 0
+	var received chatAPIRequest
+	ollama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		modelCalls++
+		_ = json.NewDecoder(r.Body).Decode(&received)
+		_ = json.NewEncoder(w).Encode(chatAPIResponse{
+			Message: chatMessage{Content: diagnosticResponseJSON(t, diagnosticFinalResponse{
+				Status: "healthy", Confidence: "confirmed",
+				Conclusion:     "I can't confirm a current server-side failure from the available evidence.",
+				PossibleCauses: []string{"An intermittent request-specific problem outside the captured log window."},
+			})},
+			Done: true, EvalCount: 18,
+		})
+	}))
+	defer ollama.Close()
+	a.ollamaURL = ollama.URL
+
+	recorder := httptest.NewRecorder()
+	capture := newSSECaptureWriter(recorder)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat/stream", nil)
+	policy := modelPolicy{Allowed: true, Model: primaryModel, Mode: "primary"}
+	if !a.handleCuratedDiagnosticStream(capture, req, "Why is MyScheduler failing?", policy) {
+		t.Fatal("expected curated diagnostic path")
+	}
+	if modelCalls != 1 {
+		t.Fatalf("model_calls=%d want 1", modelCalls)
+	}
+	if received.KeepAlive == nil || number(received.KeepAlive) != 0 {
+		t.Fatalf("keep_alive=%v want 0", received.KeepAlive)
+	}
+	var packet diagnosticEvidencePacket
+	if err := json.Unmarshal([]byte(received.Messages[2].Content), &packet); err != nil {
+		t.Fatal(err)
+	}
+	if packet.UserReportedSymptom != "Why is MyScheduler failing?" || packet.Assessment.ConfidenceCeiling != "plausible" ||
+		len(packet.Assessment.Failing) != 0 || len(packet.Assessment.PossibleCauses) == 0 ||
+		len(packet.Assessment.Working) == 0 || len(packet.Assessment.RuledOut) == 0 || len(packet.Assessment.LessLikely) == 0 ||
+		packet.RuntimeLogs == nil || !logSummarySupportsNoCurrentFailure(packet.RuntimeLogs) {
+		t.Fatalf("reported premise packet not preserved conservatively: %+v", packet)
+	}
+	if !strings.Contains(received.Messages[0].Content, "user_reported_symptom") ||
+		!strings.Contains(received.Messages[0].Content, "do not manufacture a confirmed failure") {
+		t.Fatalf("reported-premise instructions missing: %q", received.Messages[0].Content)
+	}
+	answer := capture.answer.String()
+	if !strings.Contains(answer, "**Confidence:** Plausible") || strings.Contains(answer, "**Confidence:** Confirmed") ||
+		!strings.Contains(answer, "### What remains possible") {
+		t.Fatalf("answer=%q", answer)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"model_invoked":true`) || !strings.Contains(body, `"planner_calls":0`) {
+		t.Fatalf("curated metrics missing: %s", body)
+	}
+}
+
+func TestDirectDiagnosticCauseBypassesModel(t *testing.T) {
+	logs := "2026-09-08T20:00:00Z ERROR configuration error: required backend URL is missing"
+	deployment := healthyMySchedulerDeployment()
+	deployment["status"] = "unhealthy"
+	a, cleanup := newDiagnosticTestApp(t, []any{deployment}, nil, logs, "")
 	defer cleanup()
 	modelCalls := 0
 	ollama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -448,45 +807,29 @@ func TestHealthyCausalDiagnosticBypassesModelAndRetainsEvidence(t *testing.T) {
 	if !a.handleCuratedDiagnosticStream(capture, req, "Why is MyScheduler failing?", policy) {
 		t.Fatal("expected diagnostic path")
 	}
-	if modelCalls != 0 {
-		t.Fatalf("model_calls=%d want 0", modelCalls)
-	}
-	answer := strings.ToLower(capture.answer.String())
-	if !strings.Contains(answer, "does not currently appear to be failing") ||
-		!strings.Contains(answer, "deployment healthy") ||
-		!strings.Contains(answer, "database is linked and ready") ||
-		!strings.Contains(answer, "no reliable errors or http 5xx") {
-		t.Fatalf("answer=%q", capture.answer.String())
-	}
-	body := recorder.Body.String()
-	if !strings.Contains(body, `"answer_mode":"deterministic"`) ||
-		!strings.Contains(body, `"model_invoked":false`) ||
-		!strings.Contains(body, `"planner_calls":0`) {
-		t.Fatalf("deterministic metadata missing: %s", body)
-	}
-	if len(capture.evidence) != 2 || capture.evidence[0].ToolName != "get_app_context" ||
-		capture.evidence[1].ToolName != "read_runtime_logs" {
-		t.Fatalf("evidence=%+v", capture.evidence)
+	if modelCalls != 0 || !strings.Contains(capture.answer.String(), "**Confidence:** Confirmed") ||
+		!strings.Contains(strings.ToLower(capture.answer.String()), "configuration error") {
+		t.Fatalf("model_calls=%d answer=%q", modelCalls, capture.answer.String())
 	}
 }
 
-func TestNegativePremiseUnhealthyServiceFallsThrough(t *testing.T) {
+func TestCleanVerificationUnhealthyServiceFallsThrough(t *testing.T) {
 	packet := healthyNegativePremisePacket()
 	packet.Application.Services[1].State = "stopped"
-	if answer, ok := deterministicNegativePremiseAnswer(packet, "Why is MyScheduler failing?"); ok {
+	if answer, ok := deterministicInvestigatedDiagnosticAnswer(packet, "Is MyScheduler okay?"); ok {
 		t.Fatalf("unexpected deterministic answer %q", answer)
 	}
 }
 
-func TestNegativePremiseHTTP500FallsThrough(t *testing.T) {
+func TestCleanVerificationHTTP500FallsThrough(t *testing.T) {
 	packet := healthyNegativePremisePacket()
 	packet.RuntimeLogs.HTTPStatusCounts["500"] = 1
-	if answer, ok := deterministicNegativePremiseAnswer(packet, "Why is MyScheduler failing?"); ok {
+	if answer, ok := deterministicInvestigatedDiagnosticAnswer(packet, "Is MyScheduler okay?"); ok {
 		t.Fatalf("unexpected deterministic answer %q", answer)
 	}
 }
 
-func TestNegativePremiseExplicitErrorMarkersFallThrough(t *testing.T) {
+func TestCleanVerificationExplicitErrorMarkersFallThrough(t *testing.T) {
 	for _, marker := range []string{"ERROR", "FATAL", "PANIC"} {
 		t.Run(marker, func(t *testing.T) {
 			packet := healthyNegativePremisePacket()
@@ -494,14 +837,14 @@ func TestNegativePremiseExplicitErrorMarkersFallThrough(t *testing.T) {
 				Kind: "runtime", Logs: "2026-09-08T20:00:00Z " + marker + " request failed",
 			}, "", time.Now())
 			packet.RuntimeLogs = &summary
-			if answer, ok := deterministicNegativePremiseAnswer(packet, "Why is MyScheduler failing?"); ok {
+			if answer, ok := deterministicInvestigatedDiagnosticAnswer(packet, "Is MyScheduler okay?"); ok {
 				t.Fatalf("unexpected deterministic answer %q for summary %+v", answer, summary)
 			}
 		})
 	}
 }
 
-func TestNegativePremiseMissingOrAmbiguousHealthFallsThrough(t *testing.T) {
+func TestCleanVerificationMissingOrAmbiguousHealthFallsThrough(t *testing.T) {
 	tests := []struct {
 		name   string
 		mutate func(*diagnosticEvidencePacket)
@@ -524,18 +867,18 @@ func TestNegativePremiseMissingOrAmbiguousHealthFallsThrough(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			packet := healthyNegativePremisePacket()
 			test.mutate(&packet)
-			if answer, ok := deterministicNegativePremiseAnswer(packet, "Why is MyScheduler failing?"); ok {
+			if answer, ok := deterministicInvestigatedDiagnosticAnswer(packet, "Is MyScheduler okay?"); ok {
 				t.Fatalf("unexpected deterministic answer %q", answer)
 			}
 		})
 	}
 }
 
-func TestNegativePremiseConflictingEvidenceFallsThrough(t *testing.T) {
+func TestCleanVerificationConflictingEvidenceFallsThrough(t *testing.T) {
 	packet := healthyNegativePremisePacket()
 	allRunning := false
 	packet.Application.AllServicesRunning = &allRunning
-	if answer, ok := deterministicNegativePremiseAnswer(packet, "Why is MyScheduler failing?"); ok {
+	if answer, ok := deterministicInvestigatedDiagnosticAnswer(packet, "Is MyScheduler okay?"); ok {
 		t.Fatalf("unexpected deterministic answer %q", answer)
 	}
 }
@@ -570,6 +913,28 @@ func TestDiagnosticLogSummaryPreservesRedaction(t *testing.T) {
 	encoded := diagnosticPacketJSON(summary)
 	if !summary.Redacted || strings.Contains(encoded, "super-secret") || !strings.Contains(encoded, "[REDACTED]") {
 		t.Fatalf("redaction failed: %s", encoded)
+	}
+}
+
+func TestDiagnosticVerificationQuestionClassification(t *testing.T) {
+	for _, message := range []string{
+		"Is MyScheduler okay?",
+		"Does MyScheduler have any issues?",
+		"Check whether MyScheduler is healthy.",
+		"Investigate whether MyScheduler has hidden issues.",
+	} {
+		if !isDiagnosticVerificationQuestion(message) || !isDiagnosticReasoningQuestion(message) || isExplicitDiagnosticLookup(message) {
+			t.Fatalf("verification question routed incorrectly: %q", message)
+		}
+	}
+	for _, message := range []string{
+		"Why is MyScheduler failing?",
+		"Why is MiniBase broken?",
+		"What is causing this failure?",
+	} {
+		if isDiagnosticVerificationQuestion(message) || !hasCurrentFailurePremise(message) {
+			t.Fatalf("failure premise routed incorrectly: %q", message)
+		}
 	}
 }
 

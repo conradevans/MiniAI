@@ -58,6 +58,7 @@ type chatAPIRequest struct {
 	Model     string           `json:"model"`
 	Messages  []chatMessage    `json:"messages"`
 	Tools     []toolDefinition `json:"tools,omitempty"`
+	Format    any              `json:"format,omitempty"`
 	Stream    bool             `json:"stream"`
 	Think     bool             `json:"think"`
 	KeepAlive any              `json:"keep_alive,omitempty"`
@@ -224,13 +225,13 @@ func (a *app) handleAgentChatStream(w http.ResponseWriter, r *http.Request, req 
 
 	agentStarted := time.Now()
 	systemPrompt, contextApps := a.agentSystemPrompt(r.Context(), req.Message, history)
-	sendSSE(w, "meta", map[string]any{
+	sendSSE(w, "meta", a.withInferenceProfileMetadata(policy.Model, map[string]any{
 		"model":          policy.Model,
 		"mode":           policy.Mode,
 		"context_apps":   contextApps,
 		"agent":          true,
 		"max_tool_calls": agentMaxToolCalls,
-	})
+	}))
 	flusher.Flush()
 
 	messages := []chatMessage{{Role: "system", Content: systemPrompt}}
@@ -456,10 +457,10 @@ func (a *app) callAgentPlannerWithKeepalive(ctx context.Context, model string, m
 		Stream:    false,
 		Think:     false,
 		KeepAlive: modelKeepAlive,
-		Options: map[string]any{
+		Options: a.ollamaRequestOptions(model, map[string]any{
 			"num_ctx":     8192,
 			"num_predict": 192,
-		},
+		}),
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
@@ -500,10 +501,10 @@ func (a *app) streamAgentFinalWithLimit(ctx context.Context, w io.Writer, flushe
 		Stream:    true,
 		Think:     false,
 		KeepAlive: modelKeepAlive,
-		Options: map[string]any{
+		Options: a.ollamaRequestOptions(policy.Model, map[string]any{
 			"num_ctx":     8192,
 			"num_predict": numPredict,
-		},
+		}),
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {

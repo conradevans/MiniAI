@@ -59,6 +59,9 @@ type diagnosticEvidence struct {
 }
 
 func isDiagnosticReasoningQuestion(message string) bool {
+	if isDiagnosticVerificationQuestion(message) {
+		return true
+	}
 	m := strings.ToLower(message)
 	for _, term := range []string{
 		"why", "diagnose", "debug", "investigate", "root cause", "most likely",
@@ -69,6 +72,18 @@ func isDiagnosticReasoningQuestion(message string) bool {
 		}
 	}
 	return false
+}
+
+func isDiagnosticVerificationQuestion(message string) bool {
+	m := strings.ToLower(strings.TrimSpace(message))
+	if hasCurrentFailurePremise(m) {
+		return false
+	}
+	if containsAny(m, "okay", "all good", "anything wrong", "any issue", "any problem", "hidden issue") || messageContainsTerm(m, "ok") {
+		return containsAny(m, "is ", "does ", "check", "verify", "confirm", "investigate", "whether")
+	}
+	return containsAny(m, "check whether", "verify whether", "confirm whether", "investigate whether") &&
+		containsAny(m, "healthy", "working", "issue", "problem", "error")
 }
 
 func isExplicitDiagnosticLookup(message string) bool {

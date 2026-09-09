@@ -25,7 +25,7 @@ const (
 	fallbackModel       = "qwen3:4b"
 	sessionTTL          = 45 * time.Second
 	modelIdleTTL        = 20 * time.Minute
-	modelKeepAlive      = "25m"
+	modelKeepAlive      = 0
 	primaryMinAvailable = 10.0
 	fallbackMinAvail    = 7.0
 	primaryMaxLoad      = 8.0
@@ -33,14 +33,16 @@ const (
 )
 
 type app struct {
-	started       time.Time
-	addr          string
-	ollamaURL     string
-	reactorURL    string
-	minideployURL string
-	repoRoot      string
-	client        *http.Client
-	store         *chatStore
+	started           time.Time
+	addr              string
+	ollamaURL         string
+	reactorURL        string
+	minideployURL     string
+	repoRoot          string
+	client            *http.Client
+	store             *chatStore
+	eightBProfile     ollamaInferenceProfile
+	powerLeaseManager *cpuPowerLeaseManager
 
 	mu       sync.Mutex
 	sessions map[string]*session
@@ -177,6 +179,7 @@ type psResponse struct {
 }
 
 func main() {
+	powerLeaseManager := initializeCPUPowerLeaseManager(newSudoPowerHelperRunner(), log.Printf)
 	store, err := openChatStore(env("MINIAI_DB_PATH", "/var/lib/miniai/miniai.db"))
 	if err != nil {
 		log.Fatalf("open MiniAI chat store: %v", err)
@@ -187,16 +190,20 @@ func main() {
 		}
 	}()
 
+	eightBProfile := configured8BInferenceProfile(os.Getenv("MINIAI_8B_PROFILE"), log.Printf)
+	log8BInferenceProfile(eightBProfile, log.Printf)
 	a := &app{
-		started:       time.Now(),
-		addr:          env("MINIAI_ADDR", "127.0.0.1:9300"),
-		ollamaURL:     strings.TrimRight(env("OLLAMA_URL", "http://127.0.0.1:11434"), "/"),
-		reactorURL:    strings.TrimRight(env("REACTORLAB_URL", "http://127.0.0.1:9200"), "/"),
-		minideployURL: strings.TrimRight(env("MINIDEPLOY_URL", "http://127.0.0.1:9000"), "/"),
-		repoRoot:      env("MINIAI_REPO_ROOT", "/srv"),
-		client:        &http.Client{Timeout: 10 * time.Minute},
-		store:         store,
-		sessions:      make(map[string]*session),
+		started:           time.Now(),
+		addr:              env("MINIAI_ADDR", "127.0.0.1:9300"),
+		ollamaURL:         strings.TrimRight(env("OLLAMA_URL", "http://127.0.0.1:11434"), "/"),
+		reactorURL:        strings.TrimRight(env("REACTORLAB_URL", "http://127.0.0.1:9200"), "/"),
+		minideployURL:     strings.TrimRight(env("MINIDEPLOY_URL", "http://127.0.0.1:9000"), "/"),
+		repoRoot:          env("MINIAI_REPO_ROOT", "/srv"),
+		client:            &http.Client{Timeout: 10 * time.Minute},
+		store:             store,
+		eightBProfile:     eightBProfile,
+		powerLeaseManager: powerLeaseManager,
+		sessions:          make(map[string]*session),
 	}
 
 	mux := http.NewServeMux()
@@ -495,6 +502,11 @@ func (a *app) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	preparedDiagnostic, hasPreparedDiagnostic := a.prepareDiagnosticInvestigation(r.Context(), req.Message)
+	if hasPreparedDiagnostic && emitDeterministicInvestigatedDiagnosticAnswer(w, preparedDiagnostic.packet, preparedDiagnostic.evidence, req.Message) {
+		return
+	}
+
 	sys, err := readSystemStatus()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -514,7 +526,23 @@ func (a *app) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if a.handleCuratedDiagnosticStream(w, r, req.Message, policy) {
+	ran, leaseErr := a.with8BPowerLease(r.Context(), policy.Model, func() error {
+		a.handleSelectedModelChatStream(w, r, req, policy, history, preparedDiagnostic, hasPreparedDiagnostic)
+		return nil
+	})
+	if !ran {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error":  powerLeaseUnavailableMessage(),
+			"policy": powerLeaseUnavailablePolicy(policy),
+		})
+		return
+	}
+	logPowerLeaseError(leaseErr)
+}
+
+func (a *app) handleSelectedModelChatStream(w http.ResponseWriter, r *http.Request, req chatRequest, policy modelPolicy, history []storedMessage, preparedDiagnostic preparedDiagnosticInvestigation, hasPreparedDiagnostic bool) {
+	if hasPreparedDiagnostic {
+		a.handlePreparedDiagnosticStream(w, r, req.Message, policy, preparedDiagnostic)
 		return
 	}
 	if shouldUseAgentTools(req.Message) {
@@ -533,11 +561,11 @@ func (a *app) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
-	sendSSE(w, "meta", map[string]any{
+	sendSSE(w, "meta", a.withInferenceProfileMetadata(policy.Model, map[string]any{
 		"model":        policy.Model,
 		"mode":         policy.Mode,
 		"context_apps": contextApps,
-	})
+	}))
 	flusher.Flush()
 
 	genReq := generateRequest{
@@ -546,10 +574,10 @@ func (a *app) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		Stream:    true,
 		Think:     false,
 		KeepAlive: modelKeepAlive,
-		Options: map[string]any{
+		Options: a.ollamaRequestOptions(policy.Model, map[string]any{
 			"num_ctx":     8192,
 			"num_predict": 768,
-		},
+		}),
 	}
 	body, _ := json.Marshal(genReq)
 	httpReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, a.ollamaURL+"/api/generate", strings.NewReader(string(body)))

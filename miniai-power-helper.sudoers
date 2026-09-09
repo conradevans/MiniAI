@@ -1,0 +1,6 @@
+Cmnd_Alias MINIAI_POWER_HELPER = /usr/local/libexec/miniai-power-helper enter, \
+    /usr/local/libexec/miniai-power-helper restore, \
+    /usr/local/libexec/miniai-power-helper recover, \
+    /usr/local/libexec/miniai-power-helper status
+
+miniai ALL=(root) NOPASSWD: MINIAI_POWER_HELPER
