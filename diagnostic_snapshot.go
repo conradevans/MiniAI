@@ -349,6 +349,29 @@ func (a *app) handleDeterministicDiagnosticLookup(w http.ResponseWriter, r *http
 	if !ok {
 		return false
 	}
+	return a.handleDeterministicDiagnosticSnapshot(w, r, snapshot, message)
+}
+
+func (a *app) handleConversationDiagnosticLookup(w http.ResponseWriter, r *http.Request, message string, history []storedMessage) bool {
+	if !isExplicitDiagnosticLookup(message) {
+		return false
+	}
+
+	subject := a.resolveConversationSubject(r.Context(), message, history)
+	if subject.App == "" || subject.Ambiguous {
+		return a.handleDeterministicDiagnosticLookup(w, r, message)
+	}
+
+	// Passing only the canonical app name selects identity. The snapshot
+	// resolver still fetches current ReactorLab state for this request.
+	snapshot, ok := a.resolveDiagnosticSnapshot(r.Context(), subject.App)
+	if !ok {
+		return false
+	}
+	return a.handleDeterministicDiagnosticSnapshot(w, r, snapshot, message)
+}
+
+func (a *app) handleDeterministicDiagnosticSnapshot(w http.ResponseWriter, r *http.Request, snapshot appDiagnosticSnapshot, message string) bool {
 	if isExplicitLogLookup(message) {
 		return a.handleDeterministicLogLookup(w, r, snapshot, message)
 	}

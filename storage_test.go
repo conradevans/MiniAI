@@ -75,6 +75,11 @@ func TestChatStorePersistsConversationAndEvidence(t *testing.T) {
 	if len(history) != 2 || history[1].Content != "OK" {
 		t.Fatalf("history=%+v", history)
 	}
+	if len(history[1].Evidence) != 1 ||
+		history[1].Evidence[0].App != "myscheduler" ||
+		history[1].Evidence[0].ToolName != "read_repository_file" {
+		t.Fatalf("history evidence=%+v", history[1].Evidence)
+	}
 }
 
 func TestChatStoreDeleteCascades(t *testing.T) {

@@ -181,7 +181,7 @@ func agentToolDefinitions() []toolDefinition {
 }
 
 func (a *app) agentSystemPrompt(ctx context.Context, userMessage string, history []storedMessage) (string, []string) {
-	contexts, names := a.resolveMentionedContexts(ctx, chatContextQuery(history, userMessage))
+	contexts, names := a.resolveConversationContexts(ctx, userMessage, history)
 	compact := make([]map[string]any, 0, len(contexts))
 	for _, item := range contexts {
 		compact = append(compact, compactModelContext(item))

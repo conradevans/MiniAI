@@ -64,7 +64,14 @@ func (a *app) deterministicRepositoryLookup(ctx context.Context, message string)
 	if len(apps) != 1 {
 		return deterministicRepositoryResult{}, false, false
 	}
-	index, hit, err := a.repositoryIndex(ctx, apps[0])
+	return a.deterministicRepositoryLookupForApp(ctx, message, apps[0])
+}
+
+func (a *app) deterministicRepositoryLookupForApp(ctx context.Context, message, appName string) (deterministicRepositoryResult, bool, bool) {
+	if !isSimpleRepositoryLocationQuestion(message) || appName == "" {
+		return deterministicRepositoryResult{}, false, false
+	}
+	index, hit, err := a.repositoryIndex(ctx, appName)
 	if err != nil {
 		return deterministicRepositoryResult{}, hit, false
 	}
@@ -435,6 +442,24 @@ func joinCodeItems(items []string) string {
 
 func (a *app) handleDeterministicRepositoryLookup(w http.ResponseWriter, r *http.Request, message string) bool {
 	result, indexHit, ok := a.deterministicRepositoryLookup(r.Context(), message)
+	return emitDeterministicRepositoryResult(w, result, indexHit, ok)
+}
+
+func (a *app) handleConversationRepositoryLookup(w http.ResponseWriter, r *http.Request, message string, history []storedMessage) bool {
+	if !isSimpleRepositoryLocationQuestion(message) {
+		return false
+	}
+
+	subject := a.resolveConversationSubject(r.Context(), message, history)
+	if subject.App == "" || subject.Ambiguous {
+		return a.handleDeterministicRepositoryLookup(w, r, message)
+	}
+
+	result, indexHit, ok := a.deterministicRepositoryLookupForApp(r.Context(), message, subject.App)
+	return emitDeterministicRepositoryResult(w, result, indexHit, ok)
+}
+
+func emitDeterministicRepositoryResult(w http.ResponseWriter, result deterministicRepositoryResult, indexHit, ok bool) bool {
 	if !ok {
 		return false
 	}

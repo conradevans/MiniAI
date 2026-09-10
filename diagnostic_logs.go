@@ -416,6 +416,25 @@ func (a *app) prepareDiagnosticInvestigation(ctx context.Context, message string
 	return preparedDiagnosticInvestigation{started: started, packet: packet, evidence: evidence}, true
 }
 
+func (a *app) prepareConversationDiagnosticInvestigation(ctx context.Context, message string, history []storedMessage) (preparedDiagnosticInvestigation, bool) {
+	if !isDiagnosticReasoningQuestion(message) {
+		return preparedDiagnosticInvestigation{}, false
+	}
+
+	subject := a.resolveConversationSubject(ctx, message, history)
+	if subject.App == "" || subject.Ambiguous {
+		return a.prepareDiagnosticInvestigation(ctx, message)
+	}
+
+	started := time.Now()
+	snapshot, ok := a.resolveDiagnosticSnapshot(ctx, subject.App)
+	if !ok {
+		return preparedDiagnosticInvestigation{}, false
+	}
+	packet, evidence := a.buildDiagnosticPacket(ctx, snapshot, message)
+	return preparedDiagnosticInvestigation{started: started, packet: packet, evidence: evidence}, true
+}
+
 func (a *app) handleCuratedDiagnosticStream(w http.ResponseWriter, r *http.Request, message string, policy modelPolicy) bool {
 	prepared, ok := a.prepareDiagnosticInvestigation(r.Context(), message)
 	if !ok {

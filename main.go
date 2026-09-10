@@ -495,14 +495,14 @@ func (a *app) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
-	if a.handleDeterministicRepositoryLookup(w, r, req.Message) {
+	if a.handleConversationRepositoryLookup(w, r, req.Message, history) {
 		return
 	}
-	if a.handleDeterministicDiagnosticLookup(w, r, req.Message) {
+	if a.handleConversationDiagnosticLookup(w, r, req.Message, history) {
 		return
 	}
 
-	preparedDiagnostic, hasPreparedDiagnostic := a.prepareDiagnosticInvestigation(r.Context(), req.Message)
+	preparedDiagnostic, hasPreparedDiagnostic := a.prepareConversationDiagnosticInvestigation(r.Context(), req.Message, history)
 	if hasPreparedDiagnostic && emitDeterministicInvestigatedDiagnosticAnswer(w, preparedDiagnostic.packet, preparedDiagnostic.evidence, req.Message) {
 		return
 	}
@@ -687,8 +687,7 @@ func (a *app) reaper() {
 }
 
 func (a *app) buildContextualPrompt(ctx context.Context, message string, history []storedMessage) (string, []string) {
-	query := chatContextQuery(history, message)
-	contexts, names := a.resolveMentionedContexts(ctx, query)
+	contexts, names := a.resolveConversationContexts(ctx, message, history)
 	compact := make([]map[string]any, 0, len(contexts))
 	for _, item := range contexts {
 		compact = append(compact, compactModelContext(item))

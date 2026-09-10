@@ -414,6 +414,9 @@ func (s *chatStore) history(chatID string, maxMessages, maxRunes int) ([]storedM
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
 	selected := make([]storedMessage, 0, len(reversed))
 	used := 0
 	for _, m := range reversed {
@@ -435,6 +438,15 @@ func (s *chatStore) history(chatID string, maxMessages, maxRunes int) ([]storedM
 	out := make([]storedMessage, 0, len(selected))
 	for i := len(selected) - 1; i >= 0; i-- {
 		out = append(out, selected[i])
+	}
+	for i := range out {
+		if out[i].Role != "assistant" {
+			continue
+		}
+		out[i].Evidence, err = s.messageEvidence(out[i].ID)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return out, nil
 }
