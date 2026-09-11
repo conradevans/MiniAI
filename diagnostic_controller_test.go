@@ -31,7 +31,7 @@ func TestDiagnosticControllerGathersDeploymentEvidenceByQuestion(t *testing.T) {
 	defer cleanup()
 	packet, _ := a.buildDiagnosticPacket(context.Background(), healthyNegativePremisePacket().Application, "Did MyScheduler failures begin after deployment?")
 	if packet.DeploymentLogs == nil || packet.Investigation.Rounds != 2 ||
-		!sameStrings(packet.Investigation.EvidenceExpansions, []string{diagnosticSourceRuntime, diagnosticSourceDeployment}) {
+		!sameStrings(packet.Investigation.EvidenceExpansions, []string{diagnosticSourceDeployment, diagnosticSourceRuntime}) {
 		t.Fatalf("deployment expansion missing: %+v", packet.Investigation)
 	}
 }
@@ -60,6 +60,19 @@ func TestDiagnosticControllerRetainsBoundedRepositoryEvidence(t *testing.T) {
 	}
 	if countDiagnosticTool(evidence, "search_repository") != 1 || countDiagnosticTool(evidence, "read_repository_file") != 1 {
 		t.Fatalf("repository evidence events missing or repeated: %+v", evidence)
+	}
+}
+
+func TestOrdinaryRepositoryDiagnosticKeepsOrdinaryCaveat(t *testing.T) {
+	packet := healthyNegativePremisePacket()
+	packet.Repository = []repositoryLocationEvidence{{
+		Path: "backend/routes/scheduleTemplateRoutes.js", StartLine: 8, EndLine: 18,
+	}}
+	assessment := assessDiagnosticEvidence(packet, "Why is the schedule template route failing in MyScheduler?")
+	if !containsDiagnosticFact(assessment.KeyEvidence, "relevant bounded repository evidence") ||
+		containsDiagnosticFact(assessment.KeyEvidence, "exact diff between deployed versions") ||
+		containsDiagnosticFact(assessment.KeyEvidence, "current-checkout") {
+		t.Fatalf("ordinary repository wording regressed: %+v", assessment.KeyEvidence)
 	}
 }
 

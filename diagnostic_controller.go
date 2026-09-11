@@ -40,6 +40,7 @@ type diagnosticEvidenceAssessment struct {
 }
 
 func (a *app) runDiagnosticInvestigation(ctx context.Context, snapshot appDiagnosticSnapshot, message string) (diagnosticEvidencePacket, []diagnosticEvidence) {
+	changeAware := isChangeAwareDiagnosticQuestion(message)
 	packet := diagnosticEvidencePacket{
 		Application: snapshot,
 		Unavailable: []string{},
@@ -52,6 +53,32 @@ func (a *app) runDiagnosticInvestigation(ctx context.Context, snapshot appDiagno
 		ToolName: "get_app_context", Args: map[string]any{"app": snapshot.App},
 		Summary: "resolved structured application, service, database, activity, and version state",
 	}}
+	if changeAware {
+		canonicalApp := snapshot.App
+		current, err := a.readMiniDeployCurrentDeployment(ctx, snapshot.App)
+		if err != nil {
+			appendDiagnosticUnavailable(&packet, "current deployment metadata unavailable")
+		} else {
+			canonicalApp = current.App
+			applyCurrentDeploymentMetadata(&packet.Application, current)
+			evidence = append(evidence, diagnosticEvidence{
+				ToolName: "read_current_deployment",
+				Args:     map[string]any{"app": canonicalApp},
+				Summary:  "read bounded current deployment metadata",
+			})
+		}
+		history, err := a.readMiniDeployDeploymentHistoryCanonical(ctx, canonicalApp)
+		if err != nil {
+			appendDiagnosticUnavailable(&packet, "deployment history unavailable")
+		} else {
+			packet.DeploymentHistory = &history
+			evidence = append(evidence, diagnosticEvidence{
+				ToolName: "read_deployment_history",
+				Args:     map[string]any{"app": snapshot.App},
+				Summary:  fmt.Sprintf("read %d bounded previous deployment versions", len(history.Versions)),
+			})
+		}
+	}
 	attempted := map[string]bool{}
 	for packet.Investigation.Rounds < diagnosticMaxEvidenceExpansionRounds {
 		source := nextDiagnosticEvidenceSource(packet, message, attempted)
@@ -104,6 +131,18 @@ func (a *app) runDiagnosticInvestigation(ctx context.Context, snapshot appDiagno
 }
 
 func nextDiagnosticEvidenceSource(packet diagnosticEvidencePacket, message string, attempted map[string]bool) string {
+	if isChangeAwareDiagnosticQuestion(message) {
+		if !attempted[diagnosticSourceDeployment] && diagnosticNeedsDeploymentEvidence(packet, message) {
+			return diagnosticSourceDeployment
+		}
+		if !attempted[diagnosticSourceRuntime] && diagnosticNeedsRuntimeEvidence(packet, message) {
+			return diagnosticSourceRuntime
+		}
+		if !attempted[diagnosticSourceRepository] && diagnosticNeedsRepositoryEvidence(packet, message) {
+			return diagnosticSourceRepository
+		}
+		return ""
+	}
 	if !attempted[diagnosticSourceRuntime] {
 		return diagnosticSourceRuntime
 	}
@@ -118,6 +157,9 @@ func nextDiagnosticEvidenceSource(packet diagnosticEvidencePacket, message strin
 
 func diagnosticNeedsDeploymentEvidence(packet diagnosticEvidencePacket, message string) bool {
 	lower := strings.ToLower(message)
+	if isChangeAwareDiagnosticQuestion(message) {
+		return changeQuestionNeedsDeploymentLogs(message)
+	}
 	if containsAny(lower, "deploy", "release", "rollout", "after", "what changed") ||
 		messageContainsTerm(lower, "version") || messageContainsTerm(lower, "commit") {
 		return true
@@ -300,15 +342,20 @@ func assessDiagnosticEvidence(packet diagnosticEvidencePacket, message string) d
 		assessment.PossibleCauses = append(assessment.PossibleCauses, "A deployment-related regression remains possible but is not established by timing alone.")
 	}
 	for _, snippet := range packet.Repository {
-		assessment.KeyEvidence = append(assessment.KeyEvidence, fmt.Sprintf("Relevant bounded repository evidence was found in %s at lines %d-%d.", snippet.Path, snippet.StartLine, snippet.EndLine))
+		if isChangeAwareDiagnosticQuestion(message) {
+			assessment.KeyEvidence = append(assessment.KeyEvidence, fmt.Sprintf("Current-checkout repository evidence was found in %s at lines %d-%d; this is not an exact diff between deployed versions.", snippet.Path, snippet.StartLine, snippet.EndLine))
+		} else {
+			assessment.KeyEvidence = append(assessment.KeyEvidence, fmt.Sprintf("Relevant bounded repository evidence was found in %s at lines %d-%d.", snippet.Path, snippet.StartLine, snippet.EndLine))
+		}
 	}
+	addDeploymentHistoryAssessment(&assessment, packet, message)
 	for _, unavailable := range packet.Unavailable {
 		assessment.Unknowns = append(assessment.Unknowns, unavailable+".")
 	}
 	if snapshot.Health == "" {
 		assessment.Unknowns = append(assessment.Unknowns, "Application health is unavailable.")
 	}
-	if packet.RuntimeLogs == nil {
+	if diagnosticNeedsRuntimeEvidence(packet, message) && packet.RuntimeLogs == nil {
 		assessment.Unknowns = append(assessment.Unknowns, "Recent runtime error state is unavailable.")
 	}
 	if diagnosticNeedsDeploymentEvidence(packet, message) && packet.DeploymentLogs == nil {
@@ -331,7 +378,8 @@ func assessDiagnosticEvidence(packet diagnosticEvidencePacket, message string) d
 	failureSignals := diagnosticFailureSignalCount(packet)
 	directCause := diagnosticDirectCauseEvidence(packet)
 	switch {
-	case assessment.Contradictory || len(packet.Unavailable) > 0 || snapshot.Health == "" || packet.RuntimeLogs == nil:
+	case assessment.Contradictory || len(packet.Unavailable) > 0 || snapshot.Health == "" ||
+		(diagnosticNeedsRuntimeEvidence(packet, message) && packet.RuntimeLogs == nil):
 		assessment.ConfidenceCeiling = "unknown"
 	case isDiagnosticVerificationQuestion(message) && cleanEvidence:
 		assessment.ConfidenceCeiling = "strongly_supported"
@@ -346,6 +394,9 @@ func assessDiagnosticEvidence(packet diagnosticEvidencePacket, message string) d
 		assessment.ConfidenceCeiling = "plausible"
 	default:
 		assessment.ConfidenceCeiling = "unknown"
+	}
+	if isChangeAwareDiagnosticQuestion(message) && assessment.ConfidenceCeiling == "confirmed" {
+		assessment.ConfidenceCeiling = "plausible"
 	}
 	switch {
 	case isDiagnosticUnhealthyState(snapshot.Health) || hasFailingService(snapshot):
@@ -389,7 +440,11 @@ func addDiagnosticLogAssessment(assessment *diagnosticEvidenceAssessment, summar
 	serverErrors := diagnosticHTTP5xxCount(summary)
 	if summary.ErrorCount > 0 {
 		assessment.Failing = append(assessment.Failing, fmt.Sprintf("Bounded %s logs contain %d reliable error lines.", label, summary.ErrorCount))
-		assessment.KeyEvidence = append(assessment.KeyEvidence, fmt.Sprintf("%s errors: count=%d, first=%s, last=%s.", label, summary.ErrorCount, valueOrUnknown(summary.FirstErrorTimestamp), valueOrUnknown(summary.LastErrorTimestamp)))
+		detail := fmt.Sprintf("%s errors: count=%d, first=%s, last=%s.", label, summary.ErrorCount, valueOrUnknown(summary.FirstErrorTimestamp), valueOrUnknown(summary.LastErrorTimestamp))
+		if example := firstDiagnosticErrorExample(summary); example != "" {
+			detail += fmt.Sprintf(" Example: %q.", truncateDiagnosticRunes(example, 120))
+		}
+		assessment.KeyEvidence = append(assessment.KeyEvidence, detail)
 	}
 	if serverErrors > 0 {
 		assessment.Failing = append(assessment.Failing, fmt.Sprintf("Bounded %s logs contain %d HTTP 5xx responses.", label, serverErrors))
@@ -400,6 +455,18 @@ func addDiagnosticLogAssessment(assessment *diagnosticEvidenceAssessment, summar
 	if summary.RestartCount > 0 || summary.StopCount > 0 {
 		assessment.KeyEvidence = append(assessment.KeyEvidence, fmt.Sprintf("%s lifecycle markers: restarts=%d, stops=%d.", label, summary.RestartCount, summary.StopCount))
 	}
+}
+
+func firstDiagnosticErrorExample(summary *diagnosticLogSummary) string {
+	for _, pattern := range summary.Patterns {
+		if pattern.Level == "error" {
+			if pattern.Representative != "" {
+				return pattern.Representative
+			}
+			return pattern.Signature
+		}
+	}
+	return ""
 }
 
 func diagnosticHTTP5xxCount(summary *diagnosticLogSummary) int {

@@ -498,6 +498,10 @@ func evidenceSource(toolName string) string {
 		return "runtime_logs"
 	case "read_deployment_logs":
 		return "deployment_logs"
+	case "read_deployment_history":
+		return "deployment_history"
+	case "read_current_deployment":
+		return "current_deployment"
 	case "get_app_context":
 		return "app_context"
 	case "list_apps":

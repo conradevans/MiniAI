@@ -11,26 +11,35 @@ import (
 )
 
 type appDiagnosticSnapshot struct {
-	App                string               `json:"app"`
-	CollectedAt        string               `json:"collected_at,omitempty"`
-	DeploymentState    string               `json:"deployment_state,omitempty"`
-	Strategy           string               `json:"strategy,omitempty"`
-	Services           []diagnosticService  `json:"services,omitempty"`
-	AllServicesRunning *bool                `json:"all_services_running,omitempty"`
-	Health             string               `json:"health,omitempty"`
-	HealthSource       string               `json:"health_source,omitempty"`
-	Database           *diagnosticDatabase  `json:"database,omitempty"`
-	DeployedCommit     string               `json:"deployed_commit,omitempty"`
-	RepositoryCommit   string               `json:"repository_commit,omitempty"`
-	VersionMismatch    *bool                `json:"version_mismatch,omitempty"`
-	DeployedAt         string               `json:"deployed_at,omitempty"`
-	ListenerPort       int                  `json:"listener_port,omitempty"`
-	RecentActivity     []diagnosticActivity `json:"recent_activity,omitempty"`
-	SourceStatus       map[string]string    `json:"source_status"`
+	App                            string                     `json:"app"`
+	CollectedAt                    string                     `json:"collected_at,omitempty"`
+	DeploymentState                string                     `json:"deployment_state,omitempty"`
+	Strategy                       string                     `json:"strategy,omitempty"`
+	DeploymentImage                string                     `json:"deployment_image,omitempty"`
+	DeploymentContainer            string                     `json:"deployment_container,omitempty"`
+	ContainerPort                  int                        `json:"container_port,omitempty"`
+	DeploymentServices             []deploymentHistoryService `json:"deployment_services,omitempty"`
+	DeploymentServicesTruncated    bool                       `json:"deployment_services_truncated,omitempty"`
+	DeploymentIdentifiersTruncated bool                       `json:"deployment_identifiers_truncated,omitempty"`
+	DeploymentMetadataSource       string                     `json:"deployment_metadata_source,omitempty"`
+	Services                       []diagnosticService        `json:"services,omitempty"`
+	AllServicesRunning             *bool                      `json:"all_services_running,omitempty"`
+	Health                         string                     `json:"health,omitempty"`
+	HealthSource                   string                     `json:"health_source,omitempty"`
+	Database                       *diagnosticDatabase        `json:"database,omitempty"`
+	DeployedCommit                 string                     `json:"deployed_commit,omitempty"`
+	RepositoryCommit               string                     `json:"repository_commit,omitempty"`
+	VersionMismatch                *bool                      `json:"version_mismatch,omitempty"`
+	DeployedAt                     string                     `json:"deployed_at,omitempty"`
+	ListenerPort                   int                        `json:"listener_port,omitempty"`
+	RecentActivity                 []diagnosticActivity       `json:"recent_activity,omitempty"`
+	SourceStatus                   map[string]string          `json:"source_status"`
 }
 
 type diagnosticService struct {
 	Name          string  `json:"name"`
+	Container     string  `json:"container,omitempty"`
+	Strategy      string  `json:"strategy,omitempty"`
 	State         string  `json:"state,omitempty"`
 	Health        string  `json:"health,omitempty"`
 	UptimeSeconds float64 `json:"uptime_seconds,omitempty"`
@@ -59,6 +68,9 @@ type diagnosticEvidence struct {
 }
 
 func isDiagnosticReasoningQuestion(message string) bool {
+	if isChangeAwareDiagnosticQuestion(message) {
+		return true
+	}
 	if isDiagnosticVerificationQuestion(message) {
 		return true
 	}
@@ -72,6 +84,46 @@ func isDiagnosticReasoningQuestion(message string) bool {
 		}
 	}
 	return false
+}
+
+func isChangeAwareDiagnosticQuestion(message string) bool {
+	m := strings.ToLower(strings.TrimSpace(message))
+	if containsAny(m,
+		"what changed",
+		"when did this start", "when did it start", "when did the failure start",
+		"working before", "work before", "happen after", "happened after",
+		"break after", "broke after", "failed after", "failing after",
+	) {
+		return true
+	}
+
+	deploymentIntent := messageContainsTerm(m, "deploy") ||
+		messageContainsTerm(m, "deployment") ||
+		messageContainsTerm(m, "release") ||
+		messageContainsTerm(m, "rollout") ||
+		messageContainsTerm(m, "version") ||
+		messageContainsTerm(m, "rollback")
+	temporalIntent := messageContainsTerm(m, "previous") ||
+		messageContainsTerm(m, "before") ||
+		messageContainsTerm(m, "after") ||
+		messageContainsTerm(m, "latest") ||
+		messageContainsTerm(m, "regression") ||
+		messageContainsTerm(m, "start")
+	differentIntent := messageContainsTerm(m, "different") &&
+		(deploymentIntent || temporalIntent)
+	changeIntent := messageContainsTerm(m, "change") ||
+		messageContainsTerm(m, "changed") ||
+		differentIntent ||
+		messageContainsTerm(m, "previous") ||
+		messageContainsTerm(m, "before") ||
+		messageContainsTerm(m, "after") ||
+		messageContainsTerm(m, "compare") ||
+		messageContainsTerm(m, "caused") ||
+		messageContainsTerm(m, "cause") ||
+		messageContainsTerm(m, "start") ||
+		messageContainsTerm(m, "regression")
+	return (deploymentIntent && changeIntent) ||
+		(differentIntent && temporalIntent)
 }
 
 func isDiagnosticVerificationQuestion(message string) bool {
@@ -218,7 +270,9 @@ func fillDeploymentSnapshot(snapshot *appDiagnosticSnapshot, deployment map[stri
 			allRunning = false
 		}
 		snapshot.Services = append(snapshot.Services, diagnosticService{
-			Name: stringField(container, "service"), State: state, Health: stringField(container, "health"),
+			Name: stringField(container, "service"), Container: stringField(container, "container"),
+			Strategy: stringField(container, "strategy"), State: state,
+			Health:        stringField(container, "health"),
 			UptimeSeconds: number(container["uptimeSeconds"]), RestartCount: int64(number(container["restartCount"])),
 		})
 	}

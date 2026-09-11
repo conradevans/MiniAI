@@ -38,6 +38,7 @@ func TestAgentToolsAreReadOnly(t *testing.T) {
 		"read_repository_file":      true,
 		"read_runtime_logs":         true,
 		"read_deployment_logs":      true,
+		"read_deployment_history":   true,
 	}
 	defs := agentToolDefinitions()
 	if len(defs) != len(allowed) {
@@ -86,6 +87,42 @@ func TestEncodeAgentToolResultCapsContext(t *testing.T) {
 	}
 	if !strings.Contains(got, "truncated") {
 		t.Fatalf("expected truncation marker")
+	}
+}
+
+func TestAgentDeploymentHistoryCompactionStaysValidBoundedJSON(t *testing.T) {
+	long := strings.Repeat("history-value-", 100)
+	services := make([]deploymentHistoryService, deploymentHistoryMaxServices)
+	for index := range services {
+		services[index] = deploymentHistoryService{
+			Name: long, Container: long, Image: long, Strategy: long,
+		}
+	}
+	history := deploymentHistoryToolResponse{
+		App: "myscheduler", TotalVersions: 12, Truncated: true, Redacted: true,
+		ExactCommitAvailable: false,
+		TimestampMeaning:     "archived_at is an archive/cutover time, not original deployment time",
+		Source:               "MiniDeploy private deployment-history API",
+		Versions: []deploymentHistoryVersion{{
+			Position: 0, Relation: "immediately_previous", Container: long,
+			Image: long, Strategy: long, ArchivedAt: "2026-09-10T12:34:56Z",
+			Services: services, Truncated: true,
+		}},
+	}
+	encoded := encodeAgentToolResult(compactAgentToolResult("read_deployment_history", history))
+	if !json.Valid([]byte(encoded)) || len([]rune(encoded)) > agentToolResultMaxRunes {
+		t.Fatalf("compacted history is invalid or oversized: runes=%d body=%s", len([]rune(encoded)), encoded)
+	}
+	for _, expected := range []string{
+		`"source":"MiniDeploy deployment history"`,
+		`"archived_at":"2026-09-10T12:34:56Z"`,
+		`"services_truncated":true`,
+		`"identifiers_truncated":true`,
+		`"timestamp_meaning":"archive/cutover time, not original deployment time"`,
+	} {
+		if !strings.Contains(encoded, expected) {
+			t.Errorf("compacted history lost %s: %s", expected, encoded)
+		}
 	}
 }
 

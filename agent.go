@@ -177,6 +177,13 @@ func agentToolDefinitions() []toolDefinition {
 				"lines": intProp("Optional number of recent lines, 1-200. Prefer 40-80."),
 			}),
 		}},
+		{Type: "function", Function: toolDefinitionBody{
+			Name:        "read_deployment_history",
+			Description: "Read bounded previous deployment metadata from MiniDeploy. History is newest-first, excludes the active version, contains no exact Git commit, and its archive timestamp is not the original deployment time.",
+			Parameters: obj([]string{"app"}, map[string]any{
+				"app": stringProp("Canonical deployed application name."),
+			}),
+		}},
 	}
 }
 
@@ -192,7 +199,7 @@ func (a *app) agentSystemPrompt(ctx context.Context, userMessage string, history
 	}
 
 	return `You are MiniAI, a read-only local diagnostics assistant for the Dell running ReactorLab.
-You have read-only tools for app context, repository inspection, and redacted MiniDeploy logs.
+You have read-only tools for app context, previous deployment history, repository inspection, and redacted MiniDeploy logs.
 
 Rules:
 - Production applications always have priority over MiniAI.
@@ -202,6 +209,7 @@ Rules:
 - Use the supplied APP CONTEXT first. Call tools only when they materially improve the answer.
 - For implementation/code-location questions: search the repository first, then inspect the most relevant source files before making implementation claims. MiniAI may automatically attach a small number of safe source files after a search as an evidence-quality guardrail.
 - For runtime/deployment failures: inspect structured app context first; use logs only if they are relevant or the user explicitly asks about them.
+- Deployment history contains previous rollback-capable versions, not the active version. Position 0 is immediately previous. archived_at is when that version entered history, not when it was first deployed. It does not contain an exact deployed Git commit or historical runtime health. Container identifier changes are generation/cutover facts only. Never invent a deployed-version code diff or turn timing or container churn into proof of causation.
 - Do not claim to have checked a source unless that source is in APP CONTEXT or a tool result.
 - If evidence is insufficient, say what you could not verify instead of guessing.
 - Keep tool use focused. Do not repeatedly call the same tool with the same arguments.
@@ -947,6 +955,11 @@ func looksLikeSourcePath(path string) bool {
 }
 
 func compactAgentToolResult(name string, v any) any {
+	if name == "read_deployment_history" {
+		if history, ok := v.(deploymentHistoryToolResponse); ok {
+			return coreDeploymentHistory(&history)
+		}
+	}
 	if name != "search_repository" {
 		return v
 	}
@@ -1080,6 +1093,16 @@ func (a *app) executeAgentTool(ctx context.Context, name string, args map[string
 			return nil, "", err
 		}
 		return out, fmt.Sprintf("read %d bounded deployment log lines", out.Lines), nil
+
+	case "read_deployment_history":
+		if appName == "" {
+			return nil, "", fmt.Errorf("app is required")
+		}
+		out, err := a.readMiniDeployDeploymentHistory(ctx, appName)
+		if err != nil {
+			return nil, "", err
+		}
+		return out, fmt.Sprintf("read %d bounded previous deployment versions", len(out.Versions)), nil
 
 	default:
 		return nil, "", fmt.Errorf("unknown tool %q", name)

@@ -41,6 +41,33 @@ func newDiagnosticTestApp(t *testing.T, deployments []any, services []any, runti
 	}))
 	mini := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.URL.Path == "/deployments":
+			current := []any{}
+			for _, raw := range deployments {
+				deployment, ok := raw.(map[string]any)
+				if !ok {
+					continue
+				}
+				appName := stringField(deployment, "app")
+				if appName == "" {
+					continue
+				}
+				item := map[string]any{
+					"app": appName, "image": appName + ":current",
+					"port": deployment["port"], "strategy": deployment["strategy"],
+				}
+				containers, _ := deployment["containers"].([]any)
+				if len(containers) > 0 {
+					if container, ok := containers[0].(map[string]any); ok {
+						item["container"] = container["container"]
+						item["containerPort"] = container["containerPort"]
+					}
+				}
+				current = append(current, item)
+			}
+			_ = json.NewEncoder(w).Encode(current)
+		case strings.HasSuffix(r.URL.Path, "/history"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"app": "myscheduler", "versions": []any{}})
 		case strings.HasSuffix(r.URL.Path, "/deploy-logs"):
 			_ = json.NewEncoder(w).Encode(map[string]any{"app": "myscheduler", "logs": deploymentLogs})
 		case strings.HasSuffix(r.URL.Path, "/logs"):
@@ -63,8 +90,14 @@ func healthyMySchedulerDeployment() map[string]any {
 	return map[string]any{
 		"app": "myscheduler", "status": "healthy", "strategy": "fullstack-vite-node",
 		"containers": []any{
-			map[string]any{"service": "frontend", "state": "running", "health": "healthy", "uptimeSeconds": 900.0, "restartCount": 0.0},
-			map[string]any{"service": "backend", "state": "running", "health": "healthy", "uptimeSeconds": 850.0, "restartCount": 1.0},
+			map[string]any{
+				"service": "frontend", "container": "myscheduler-current-frontend", "strategy": "vite-static",
+				"state": "running", "health": "healthy", "uptimeSeconds": 900.0, "restartCount": 0.0,
+			},
+			map[string]any{
+				"service": "backend", "container": "myscheduler-current-backend", "strategy": "node-express",
+				"state": "running", "health": "healthy", "uptimeSeconds": 850.0, "restartCount": 1.0,
+			},
 		},
 		"database": map[string]any{"state": "linked", "displayName": "MyScheduler Production", "status": "ready"},
 	}
@@ -544,6 +577,8 @@ func TestCausalDiagnosticUsesCuratedToolFreePacket(t *testing.T) {
 	if !strings.Contains(prompt, "Return only one JSON object") ||
 		!strings.Contains(prompt, "Do not add fields outside the schema") ||
 		!strings.Contains(prompt, "Never exceed the confidence_ceiling") ||
+		!strings.Contains(prompt, "Never make a definitive negative deployment-causality claim") ||
+		!strings.Contains(prompt, "A healthy current state proves only current health") ||
 		!strings.Contains(prompt, "Timing alone is not causation") {
 		t.Fatalf("curated structured-output instructions missing: %q", prompt)
 	}
@@ -613,11 +648,77 @@ func TestParseDiagnosticFinalResponse(t *testing.T) {
 	if response, err := parseDiagnosticFinalResponse(causal, assessment, false); err == nil {
 		t.Fatalf("unsupported causal certainty accepted: %+v", response)
 	}
+	causalArray := `{"status":"degraded","confidence":"plausible","conclusion":"Timing overlaps.","possible_causes":["The latest deployment caused the outage."]}`
+	if response, err := parseDiagnosticFinalResponse(causalArray, assessment, false); err == nil {
+		t.Fatalf("unsupported causal certainty in response array accepted: %+v", response)
+	}
 	confirmedAssessment := assessment
 	confirmedAssessment.ConfidenceCeiling = "confirmed"
 	confirmed := `{"status":"degraded","confidence":"confirmed","conclusion":"The request failed because it was caused by the explicit configuration mismatch."}`
 	if _, err := parseDiagnosticFinalResponse(confirmed, confirmedAssessment, false); err != nil {
 		t.Fatalf("confirmed causal response rejected: %v", err)
+	}
+}
+
+func TestParseDiagnosticFinalResponseRejectsUnsupportedNegativeDeploymentCausality(t *testing.T) {
+	assessment := diagnosticEvidenceAssessment{
+		Status: "healthy", ConfidenceCeiling: "unknown",
+		Working: []string{"MyScheduler is currently healthy."},
+	}
+	cases := []string{
+		"The deploy did not cause the issue.",
+		"The deployment wasn't responsible for the problem.",
+		"This was not caused by the deploy.",
+		"The latest deployment caused no problem.",
+		"The deploy can be ruled out.",
+		"The deployment is not the cause.",
+	}
+	for _, conclusion := range cases {
+		raw := diagnosticResponseJSON(t, diagnosticFinalResponse{Status: "healthy", Confidence: "unknown", Conclusion: conclusion})
+		if response, err := parseDiagnosticFinalResponse(raw, assessment, false); err == nil {
+			t.Fatalf("unsupported negative deployment causality accepted: %+v from %q", response, conclusion)
+		}
+	}
+
+	confirmedAssessment := assessment
+	confirmedAssessment.ConfidenceCeiling = "confirmed"
+	confirmed := diagnosticResponseJSON(t, diagnosticFinalResponse{Status: "healthy", Confidence: "confirmed", Conclusion: "The deployment did not cause the issue."})
+	if response, err := parseDiagnosticFinalResponse(confirmed, confirmedAssessment, false); err == nil {
+		t.Fatalf("confirmed confidence bypassed negative-causality validation: %+v", response)
+	}
+}
+
+func TestParseDiagnosticFinalResponseAllowsCurrentHealthAndCausalUncertainty(t *testing.T) {
+	assessment := diagnosticEvidenceAssessment{
+		Status: "healthy", ConfidenceCeiling: "unknown",
+		Working: []string{"MyScheduler is currently healthy."},
+	}
+	cases := []string{
+		"MyScheduler is currently healthy.",
+		"The available evidence does not establish that the latest deployment caused the issue.",
+		"MyScheduler is currently healthy, but that does not prove the latest deployment never caused an issue.",
+	}
+	for _, conclusion := range cases {
+		raw := diagnosticResponseJSON(t, diagnosticFinalResponse{Status: "healthy", Confidence: "unknown", Conclusion: conclusion})
+		if _, err := parseDiagnosticFinalResponse(raw, assessment, false); err != nil {
+			t.Fatalf("safe factual or uncertainty statement rejected: %v from %q", err, conclusion)
+		}
+	}
+}
+
+func TestDiagnosticCausalityKeepsTimingScopedToObservedEvidence(t *testing.T) {
+	assessment := diagnosticEvidenceAssessment{Status: "degraded", ConfidenceCeiling: "plausible"}
+	scoped := diagnosticResponseJSON(t, diagnosticFinalResponse{Status: "degraded", Confidence: "plausible", Conclusion: "The observed error predates the cutover."})
+	if _, err := parseDiagnosticFinalResponse(scoped, assessment, false); err != nil {
+		t.Fatalf("scoped timestamp statement rejected: %v", err)
+	}
+	broad := diagnosticResponseJSON(t, diagnosticFinalResponse{Status: "degraded", Confidence: "plausible", Conclusion: "The deployment caused no issues."})
+	if response, err := parseDiagnosticFinalResponse(broad, assessment, false); err == nil {
+		t.Fatalf("broad negative causality accepted: %+v", response)
+	}
+	unknownOrdering := diagnosticResponseJSON(t, diagnosticFinalResponse{Status: "degraded", Confidence: "unknown", Conclusion: "Event ordering is unknown, so the deploy can be ruled out."})
+	if response, err := parseDiagnosticFinalResponse(unknownOrdering, assessment, false); err == nil {
+		t.Fatalf("unknown ordering ruled deployment out: %+v", response)
 	}
 }
 
@@ -690,6 +791,50 @@ func TestCuratedDiagnosticInvalidStructuredOutputUsesSafeFallback(t *testing.T) 
 	}
 	if len(capture.evidence) != 2 {
 		t.Fatalf("evidence=%+v", capture.evidence)
+	}
+}
+
+func TestRejectedNegativeDeploymentCausalityUsesUncertaintyFallback(t *testing.T) {
+	a, cleanup := newDiagnosticTestApp(t, []any{healthyMySchedulerDeployment()}, nil, "", "")
+	defer cleanup()
+	unsafe := diagnosticResponseJSON(t, diagnosticFinalResponse{Status: "healthy", Confidence: "unknown", Conclusion: "The latest deploy did not cause an observable issue."})
+	ollama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(chatAPIResponse{
+			Message: chatMessage{Content: unsafe},
+			Done:    true, PromptEvalCount: 210, EvalCount: 18, EvalDuration: int64(time.Second),
+		})
+	}))
+	defer ollama.Close()
+	a.ollamaURL = ollama.URL
+
+	packet := healthyNegativePremisePacket()
+	packet.DeploymentHistory = &deploymentHistoryToolResponse{
+		App: "myscheduler",
+		Versions: []deploymentHistoryVersion{{
+			Relation: "immediately_previous", ArchivedAt: "2026-09-10T12:35:00Z",
+		}},
+	}
+	question := "Was this caused by the latest deploy?"
+	packet.Assessment = assessDiagnosticEvidence(packet, question)
+
+	recorder := httptest.NewRecorder()
+	capture := newSSECaptureWriter(recorder)
+	policy := modelPolicy{Allowed: true, Model: primaryModel, Mode: "primary"}
+	err := a.streamCuratedDiagnosticFinalWithLimit(
+		context.Background(), capture, capture, policy, []chatMessage{{Role: "user", Content: question}},
+		0, 0, time.Now(), diagnosticOutputNormal, packet, question,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	answer := capture.answer.String()
+	if containsUnsupportedNegativeDeploymentCausality(answer) {
+		t.Fatalf("unsafe negative causality leaked through fallback: %s", answer)
+	}
+	if !strings.Contains(answer, "current state is healthy") ||
+		!strings.Contains(answer, "does not establish whether") ||
+		!strings.Contains(answer, "cannot rule the deployment in or out") {
+		t.Fatalf("safe uncertainty fallback missing known or unknown facts: %s", answer)
 	}
 }
 

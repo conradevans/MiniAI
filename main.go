@@ -216,6 +216,7 @@ func main() {
 	mux.HandleFunc("GET /api/v1/apps/{app}/repo/search", a.handleRepoSearch)
 	mux.HandleFunc("GET /api/v1/apps/{app}/logs/runtime", a.handleRuntimeLogs)
 	mux.HandleFunc("GET /api/v1/apps/{app}/logs/deployment", a.handleDeploymentLogs)
+	mux.HandleFunc("GET /api/v1/apps/{app}/deployment-history", a.handleDeploymentHistory)
 	mux.HandleFunc("GET /api/v1/chats", a.handleListChats)
 	mux.HandleFunc("POST /api/v1/chats", a.handleCreateChat)
 	mux.HandleFunc("GET /api/v1/chats/{id}", a.handleGetChat)
@@ -504,6 +505,15 @@ func (a *app) handleChatStream(w http.ResponseWriter, r *http.Request) {
 
 	preparedDiagnostic, hasPreparedDiagnostic := a.prepareConversationDiagnosticInvestigation(r.Context(), req.Message, history)
 	if hasPreparedDiagnostic && emitDeterministicInvestigatedDiagnosticAnswer(w, preparedDiagnostic.packet, preparedDiagnostic.evidence, req.Message) {
+		return
+	}
+	if !hasPreparedDiagnostic && isChangeAwareDiagnosticQuestion(req.Message) {
+		emitDeterministicDiagnosticAnswer(
+			w,
+			unresolvedChangeAwareDiagnosticAnswer(),
+			nil,
+			map[string]any{"evidence_sources": 0},
+		)
 		return
 	}
 
