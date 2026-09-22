@@ -55,20 +55,91 @@ func phase0CapabilityRegistry() capabilityRegistry {
 			handler:    handler,
 		}
 	}
+	windowProperties := func() map[string]any {
+		return map[string]any{
+			"range": stringProp("Optional named window: 15m, 1h, 6h, 24h, or 7d. Do not combine with from/to."),
+			"from":  stringProp("Optional RFC3339 start timestamp. Must be supplied together with to."),
+			"to":    stringProp("Optional RFC3339 end timestamp. Must be supplied together with from."),
+		}
+	}
 
 	return capabilityRegistry{capabilities: []capability{
 		readCapability(toolDefinition{Type: "function", Function: toolDefinitionBody{
+			Name:        "get_platform_overview",
+			Description: "Preferred first read for broad Dell health questions. Returns current system, recovery, deployment, database, and service state with partial availability preserved.",
+			Parameters:  obj(nil, map[string]any{}),
+		}}, executeGetPlatformOverviewCapability),
+		readCapability(toolDefinition{Type: "function", Function: toolDefinitionBody{
 			Name:        "list_apps",
-			Description: "List deployed applications and their high-level health/database/repository linkage.",
+			Description: "List current deployments with exact deployed source identity when known, immutable image identity, database relationships, and separate local repository evidence.",
 			Parameters:  obj(nil, map[string]any{}),
 		}}, executeListAppsCapability),
 		readCapability(toolDefinition{Type: "function", Function: toolDefinitionBody{
 			Name:        "get_app_context",
-			Description: "Get current read-only app context: deployment, database, Dell resource usage, recent activity, and repository identity.",
+			Description: "Get current typed deployment, exact deployed source when known, attached databases, Dell overview, recovery state, and separate local repository evidence.",
 			Parameters: obj([]string{"app"}, map[string]any{
 				"app": stringProp("Deployment application name, for example myscheduler."),
 			}),
 		}}, executeGetAppContextCapability),
+		readCapability(toolDefinition{Type: "function", Function: toolDefinitionBody{
+			Name:        "read_host_history",
+			Description: "Read bounded historical Dell CPU, memory, load, disk, disk I/O, and network measurements. Correlation does not prove causation.",
+			Parameters:  obj(nil, windowProperties()),
+		}}, executeReadHostHistoryCapability),
+		readCapability(toolDefinition{Type: "function", Function: toolDefinitionBody{
+			Name:        "read_temperature_history",
+			Description: "Read bounded historical temperature minimum, average, maximum, peak time, and sample counts.",
+			Parameters:  obj(nil, windowProperties()),
+		}}, executeReadTemperatureHistoryCapability),
+		readCapability(toolDefinition{Type: "function", Function: toolDefinitionBody{
+			Name:        "read_application_history",
+			Description: "Resolve a deployed app to an observability application and read bounded historical CPU, memory, network, status, and restart-count evidence.",
+			Parameters: obj([]string{"app"}, mergeToolProperties(
+				windowProperties(),
+				map[string]any{"app": stringProp("Deployed application name to resolve safely by observability ID or name.")},
+			)),
+		}}, executeReadApplicationHistoryCapability),
+		readCapability(toolDefinition{Type: "function", Function: toolDefinitionBody{
+			Name:        "read_service_history",
+			Description: "Read bounded historical platform-service availability. An optional service filters by an exact case-insensitive returned ID or name.",
+			Parameters: obj(nil, mergeToolProperties(
+				windowProperties(),
+				map[string]any{"service": stringProp("Optional returned service ID or name. It is never used as a path.")},
+			)),
+		}}, executeReadServiceHistoryCapability),
+		readCapability(toolDefinition{Type: "function", Function: toolDefinitionBody{
+			Name:        "read_infrastructure_events",
+			Description: "Read bounded newest-first infrastructure events for a named or explicit historical window.",
+			Parameters: obj(nil, mergeToolProperties(
+				windowProperties(),
+				map[string]any{"limit": intProp("Optional event limit from 1 through 500; defaults to 100.")},
+			)),
+		}}, executeReadInfrastructureEventsCapability),
+		readCapability(toolDefinition{Type: "function", Function: toolDefinitionBody{
+			Name:        "list_databases",
+			Description: "List safe current database metrics, cumulative transaction/cache/row counters, backup summaries, and deployment relationships.",
+			Parameters:  obj(nil, map[string]any{}),
+		}}, executeListDatabasesCapability),
+		readCapability(toolDefinition{Type: "function", Function: toolDefinitionBody{
+			Name:        "read_database_backups",
+			Description: "Read a bounded newest-first safe backup inventory for one database.",
+			Parameters: obj([]string{"database_id"}, map[string]any{
+				"database_id": stringProp("Canonical database resource ID."),
+				"limit":       intProp("Optional backup limit from 1 through 200; defaults to 100."),
+			}),
+		}}, executeReadDatabaseBackupsCapability),
+		readCapability(toolDefinition{Type: "function", Function: toolDefinitionBody{
+			Name:        "read_activity",
+			Description: "Read bounded newest-first recent platform and database Activity. This is not permanent historical retention.",
+			Parameters: obj(nil, map[string]any{
+				"limit": intProp("Optional Activity limit from 1 through 200; defaults to 100."),
+			}),
+		}}, executeReadActivityCapability),
+		readCapability(toolDefinition{Type: "function", Function: toolDefinitionBody{
+			Name:        "read_recovery",
+			Description: "Read current recovery protection, hardware watchdog and RTC state, plus bounded recovery incidents.",
+			Parameters:  obj(nil, map[string]any{}),
+		}}, executeReadRecoveryCapability),
 		readCapability(toolDefinition{Type: "function", Function: toolDefinitionBody{
 			Name:        "list_repository_directory",
 			Description: "List a safe directory inside an application's repository. Secret/noise paths are blocked.",
@@ -112,12 +183,26 @@ func phase0CapabilityRegistry() capabilityRegistry {
 		}}, executeReadDeploymentLogsCapability),
 		readCapability(toolDefinition{Type: "function", Function: toolDefinitionBody{
 			Name:        "read_deployment_history",
-			Description: "Read bounded previous deployment metadata from MiniDeploy. History is newest-first, excludes the active version, contains no exact Git commit, and its archive timestamp is not the original deployment time.",
+			Description: "Read bounded deployment rollback history from ReactorLab. Exact source commits and activation times are preserved when known; archivedAt is archive-entry time, not original activation time.",
 			Parameters: obj([]string{"app"}, map[string]any{
 				"app": stringProp("Canonical deployed application name."),
 			}),
 		}}, executeReadDeploymentHistoryCapability),
 	}}
+}
+
+func mergeToolProperties(
+	left map[string]any,
+	right map[string]any,
+) map[string]any {
+	merged := make(map[string]any, len(left)+len(right))
+	for key, value := range left {
+		merged[key] = value
+	}
+	for key, value := range right {
+		merged[key] = value
+	}
+	return merged
 }
 
 func (r capabilityRegistry) toolDefinitions() []toolDefinition {

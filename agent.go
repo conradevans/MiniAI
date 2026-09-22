@@ -50,6 +50,47 @@ func (a *app) handleAgentChatStream(w http.ResponseWriter, r *http.Request, req 
 	fastEvidence := make([]chatMessage, 0, agentEvidenceMaxFiles)
 	sourceReads := 0
 
+	// Exact deployment identity must come from the typed ReactorLab source
+	// projection, never from a legacy browser/admin snapshot or local checkout.
+	if requiresTypedDeploymentIdentity(req.Message) {
+		for _, appName := range contextApps {
+			if !budget.canCallTool(toolCallsUsed) {
+				break
+			}
+			usedAnyTool = true
+			toolCallsUsed++
+			args := map[string]any{"app": appName}
+			sendSSE(w, "tool", agentToolEvent{
+				Phase: "start", Name: "get_app_context", Arguments: args,
+				Summary: "typed deployment identity evidence floor",
+			})
+			flusher.Flush()
+
+			result, summary, err := executor.Execute(
+				r.Context(),
+				"get_app_context",
+				args,
+			)
+			if err != nil {
+				result = map[string]any{"error": err.Error()}
+				summary = "tool failed: " + err.Error()
+			}
+			messages = append(messages, chatMessage{
+				Role:     "tool",
+				ToolName: "get_app_context",
+				Content: encodeAgentToolResult(compactAgentToolResult(
+					"get_app_context",
+					result,
+				)),
+			})
+			sendSSE(w, "tool", agentToolEvent{
+				Phase: "result", Name: "get_app_context",
+				Summary: summary + " (typed deployment identity evidence floor)",
+			})
+			flusher.Flush()
+		}
+	}
+
 	// Code-location questions must never terminate with a permission-seeking
 	// answer such as "would you like me to search?". Seed one safe repository
 	// search when exactly one app is already resolved. Simple location questions can

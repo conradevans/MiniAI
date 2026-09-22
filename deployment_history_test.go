@@ -211,36 +211,73 @@ func TestReadDeploymentHistoryHandlesUnknownUnavailableMalformedAndCancellation(
 
 func TestDeploymentHistoryToolUsesOnlyReadOnlyGETAndPreservesProvenance(t *testing.T) {
 	requests := []string{}
-	server := newDeploymentHistoryTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	commit := strings.Repeat("a", 40)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests = append(requests, r.Method+" "+r.URL.Path)
+		if r.Method != http.MethodGet ||
+			r.URL.Path != "/internal/miniai/v1/deployments/myscheduler/history" {
+
+			t.Fatalf("unexpected ReactorLab request: %s %s", r.Method, r.URL.Path)
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"app": "myscheduler",
 			"versions": []any{map[string]any{
-				"app": "myscheduler", "image": "app:previous", "deployedAt": "2026-09-10T12:34:56Z",
+				"app":      "myscheduler",
+				"strategy": "node-express",
+				"source": map[string]any{
+					"provider": "github", "repository": "owner/myscheduler",
+					"branch": "main", "requestedRef": "refs/heads/main",
+					"commitSha": commit,
+				},
+				"activatedAt": "2026-09-09T12:34:56Z",
+				"archivedAt":  "2026-09-10T12:34:56Z",
+				"imageId":     "sha256:" + strings.Repeat("b", 64),
+				"services":    []any{},
 			}},
 		})
 	}))
 	defer server.Close()
-	a := &app{minideployURL: server.URL, client: server.Client()}
+	miniDeployCalled := false
+	miniDeploy := httptest.NewServer(http.HandlerFunc(func(
+		http.ResponseWriter,
+		*http.Request,
+	) {
+		miniDeployCalled = true
+	}))
+	defer miniDeploy.Close()
+	a := &app{
+		reactorURL: server.URL, minideployURL: miniDeploy.URL,
+		client: server.Client(),
+	}
 
 	result, summary, err := a.executeAgentTool(
 		context.Background(),
 		"read_deployment_history",
-		map[string]any{"app": "MyScheduler"},
+		map[string]any{"app": "myscheduler"},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, ok := result.(deploymentHistoryToolResponse)
+	got, ok := result.(reactorLabDeploymentHistory)
 	if !ok || len(got.Versions) != 1 || got.App != "myscheduler" ||
-		!strings.Contains(got.Source, "MiniDeploy") ||
+		got.Versions[0].Source == nil ||
+		got.Versions[0].Source.Provider != "github" ||
+		got.Versions[0].Source.Repository != "owner/myscheduler" ||
+		got.Versions[0].Source.RequestedRef != "refs/heads/main" ||
+		got.Versions[0].Source.CommitSHA != commit ||
+		got.Versions[0].ActivatedAt == nil ||
+		got.Versions[0].ActivatedAt.Equal(got.Versions[0].ArchivedAt) ||
 		!strings.Contains(summary, "1 bounded previous") {
+
 		t.Fatalf("result=%+v requests=%v summary=%q", result, requests, summary)
 	}
 	if !sameStrings(requests, []string{
-		"GET /deployments/myscheduler/history",
+		"GET /internal/miniai/v1/deployments/myscheduler/history",
 	}) {
 		t.Fatalf("history requests=%v", requests)
+	}
+	if miniDeployCalled {
+		t.Fatal("agent deployment history called MiniDeploy directly")
 	}
 	if evidenceSource("read_deployment_history") != "deployment_history" {
 		t.Fatal("deployment-history evidence provenance is not distinct")

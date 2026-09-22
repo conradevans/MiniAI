@@ -222,7 +222,7 @@ func TestDeterministicMiniBaseServiceHealth(t *testing.T) {
 	}
 }
 
-func TestDeterministicDeployedCommitWhenPresent(t *testing.T) {
+func TestDeployedCommitBypassesLegacyDeterministicRead(t *testing.T) {
 	deployment := healthyMySchedulerDeployment()
 	deployment["commit"] = "abcdef123456"
 	a, cleanup := newDiagnosticTestApp(t, []any{deployment}, nil, "", "")
@@ -230,12 +230,19 @@ func TestDeterministicDeployedCommitWhenPresent(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	capture := newSSECaptureWriter(recorder)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat/stream", nil)
-	if !a.handleDeterministicDiagnosticLookup(capture, req, "What commit is MyScheduler deployed on?") {
-		t.Fatal("expected deterministic deployed-commit answer")
+	if a.handleDeterministicDiagnosticLookup(
+		capture,
+		req,
+		"What commit is MyScheduler deployed on?",
+	) {
+		t.Fatal("legacy deterministic read answered an exact deployment identity question")
 	}
-	if !strings.Contains(capture.answer.String(), "abcdef123456") ||
-		!strings.Contains(recorder.Body.String(), `"model_invoked":false`) {
-		t.Fatalf("answer=%q stream=%s", capture.answer.String(), recorder.Body.String())
+	if capture.answer.Len() != 0 || recorder.Body.Len() != 0 {
+		t.Fatalf(
+			"legacy answer=%q stream=%s",
+			capture.answer.String(),
+			recorder.Body.String(),
+		)
 	}
 }
 

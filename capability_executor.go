@@ -36,26 +36,40 @@ func (a *app) executeAgentTool(ctx context.Context, name string, args map[string
 }
 
 func executeListAppsCapability(ctx context.Context, a *app, _ map[string]any) (any, string, error) {
-	deployments, err := a.fetchDeployments(ctx)
+	deployments, err := a.reactorLabReads().Deployments(ctx)
 	if err != nil {
 		return nil, "", err
 	}
-	out := make([]appSummary, 0, len(deployments))
-	for _, d := range deployments {
-		appName, _ := d["app"].(string)
-		if appName == "" {
-			continue
-		}
-		status, _ := d["status"].(string)
-		dbName := ""
-		if db, ok := d["database"].(map[string]any); ok {
-			dbName, _ = db["displayName"].(string)
-		}
-		repo := a.readRepoContext(appName)
-		out = append(out, appSummary{App: appName, Status: status, Database: dbName, RepositoryPath: repo.Path, RepositoryFound: repo.Exists})
+	sort.Slice(deployments.Deployments, func(i, j int) bool {
+		return deployments.Deployments[i].App <
+			deployments.Deployments[j].App
+	})
+	total := len(deployments.Deployments)
+	truncated := total > reactorLabMaxToolApps
+	if truncated {
+		deployments.Deployments =
+			deployments.Deployments[:reactorLabMaxToolApps]
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].App < out[j].App })
-	return map[string]any{"apps": out}, fmt.Sprintf("listed %d deployed apps", len(out)), nil
+	out := make([]reactorLabAppSummary, 0, len(deployments.Deployments))
+	for _, deployment := range deployments.Deployments {
+		out = append(out, reactorLabAppSummary{
+			App:             deployment.App,
+			Strategy:        deployment.Strategy,
+			Status:          deployment.Status,
+			SourceAvailable: deployment.Source != nil,
+			Source:          deployment.Source,
+			ActivatedAt:     deployment.ActivatedAt,
+			ImageID:         deployment.ImageID,
+			Services:        deployment.Services,
+			Databases:       deployment.Databases,
+			LocalRepository: localRepositoryEvidenceFrom(
+				a.readRepoContext(deployment.App),
+			),
+		})
+	}
+	return reactorLabAppListResult{
+		Apps: out, TotalApps: total, Truncated: truncated,
+	}, fmt.Sprintf("listed %d deployed apps", len(out)), nil
 }
 
 func executeGetAppContextCapability(ctx context.Context, a *app, args map[string]any) (any, string, error) {
@@ -63,11 +77,11 @@ func executeGetAppContextCapability(ctx context.Context, a *app, args map[string
 	if appName == "" {
 		return nil, "", fmt.Errorf("app is required")
 	}
-	out, err := a.resolveAppContext(ctx, appName)
+	out, err := a.readReactorLabAppContext(ctx, appName)
 	if err != nil {
 		return nil, "", err
 	}
-	return compactModelContext(out), "resolved current context for " + appName, nil
+	return out, "resolved current context for " + out.App, nil
 }
 
 func executeListRepositoryDirectoryCapability(_ context.Context, a *app, args map[string]any) (any, string, error) {
@@ -142,11 +156,22 @@ func executeReadDeploymentHistoryCapability(ctx context.Context, a *app, args ma
 	if appName == "" {
 		return nil, "", fmt.Errorf("app is required")
 	}
-	out, err := a.readMiniDeployDeploymentHistory(ctx, appName)
+	canonical, err := canonicalReactorLabAppName(
+		ctx,
+		a.reactorLabReads(),
+		appName,
+	)
 	if err != nil {
 		return nil, "", err
 	}
-	return out, fmt.Sprintf("read %d bounded previous deployment versions", len(out.Versions)), nil
+	out, err := a.reactorLabReads().DeploymentHistory(ctx, canonical)
+	if err != nil {
+		return nil, "", err
+	}
+	return out, fmt.Sprintf(
+		"read %d bounded previous deployment versions",
+		len(out.Versions),
+	), nil
 }
 
 func boundedLogLines(args map[string]any) int {

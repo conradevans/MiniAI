@@ -3,15 +3,26 @@ package main
 import (
 	"context"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 )
 
-func TestPhase0CapabilityRegistryCompleteStableReadOnlySet(t *testing.T) {
+func TestPhase1CCapabilityRegistryCompleteStableReadOnlySet(t *testing.T) {
 	registry := phase0CapabilityRegistry()
 	wantOrder := []string{
+		"get_platform_overview",
 		"list_apps",
 		"get_app_context",
+		"read_host_history",
+		"read_temperature_history",
+		"read_application_history",
+		"read_service_history",
+		"read_infrastructure_events",
+		"list_databases",
+		"read_database_backups",
+		"read_activity",
+		"read_recovery",
 		"list_repository_directory",
 		"search_repository",
 		"read_repository_file",
@@ -28,7 +39,12 @@ func TestPhase0CapabilityRegistryCompleteStableReadOnlySet(t *testing.T) {
 			t.Fatalf("capability %d=%q want %q", index, got, wantOrder[index])
 		}
 		if item.Kind != capabilityKindRead || item.Undo != undoModeNone {
-			t.Fatalf("capability %q kind=%q undo=%q want read/none", item.Definition.Function.Name, item.Kind, item.Undo)
+			t.Fatalf(
+				"capability %q kind=%q undo=%q want read/none",
+				item.Definition.Function.Name,
+				item.Kind,
+				item.Undo,
+			)
 		}
 		if item.Kind == capabilityKindAction {
 			actionCount++
@@ -48,121 +64,109 @@ func TestPhase0CapabilityRegistryCompleteStableReadOnlySet(t *testing.T) {
 	}
 }
 
-func TestPhase0CapabilityRegistryPreservesToolDefinitions(t *testing.T) {
-	type expectedProperty struct {
-		typeName    string
-		description string
-	}
-	type expectedDefinition struct {
-		name        string
-		description string
-		required    []string
-		properties  map[string]expectedProperty
-	}
-	expected := []expectedDefinition{
-		{
-			name:        "list_apps",
-			description: "List deployed applications and their high-level health/database/repository linkage.",
-			properties:  map[string]expectedProperty{},
-		},
-		{
-			name:        "get_app_context",
-			description: "Get current read-only app context: deployment, database, Dell resource usage, recent activity, and repository identity.",
-			required:    []string{"app"},
-			properties: map[string]expectedProperty{
-				"app": {typeName: "string", description: "Deployment application name, for example myscheduler."},
-			},
-		},
-		{
-			name:        "list_repository_directory",
-			description: "List a safe directory inside an application's repository. Secret/noise paths are blocked.",
-			required:    []string{"app", "path"},
-			properties: map[string]expectedProperty{
-				"app":  {typeName: "string", description: "Application name."},
-				"path": {typeName: "string", description: "Repository-relative directory path, or . for repository root."},
-			},
-		},
-		{
-			name:        "search_repository",
-			description: "Search safe text files in an application's repository. Use this before reading files when locating implementation code.",
-			required:    []string{"app", "query"},
-			properties: map[string]expectedProperty{
-				"app":   {typeName: "string", description: "Application name."},
-				"query": {typeName: "string", description: "Literal text to search for."},
-				"path":  {typeName: "string", description: "Optional repository-relative directory path; defaults to ."},
-			},
-		},
-		{
-			name:        "read_repository_file",
-			description: "Read one safe text file from an application's repository. Secret files, binaries, symlinks, traversal, and oversized files are blocked.",
-			required:    []string{"app", "path"},
-			properties: map[string]expectedProperty{
-				"app":  {typeName: "string", description: "Application name."},
-				"path": {typeName: "string", description: "Repository-relative source file path."},
-			},
-		},
-		{
-			name:        "read_runtime_logs",
-			description: "Read bounded recent runtime logs through MiniDeploy's private redacted log API. Use only when runtime evidence is relevant.",
-			required:    []string{"app"},
-			properties: map[string]expectedProperty{
-				"app":   {typeName: "string", description: "Application name."},
-				"lines": {typeName: "integer", description: "Optional number of recent lines, 1-200. Prefer 40-80."},
-			},
-		},
-		{
-			name:        "read_deployment_logs",
-			description: "Read bounded deployment/build lifecycle logs through MiniDeploy's private redacted log API.",
-			required:    []string{"app"},
-			properties: map[string]expectedProperty{
-				"app":   {typeName: "string", description: "Application name."},
-				"lines": {typeName: "integer", description: "Optional number of recent lines, 1-200. Prefer 40-80."},
-			},
-		},
-		{
-			name:        "read_deployment_history",
-			description: "Read bounded previous deployment metadata from MiniDeploy. History is newest-first, excludes the active version, contains no exact Git commit, and its archive timestamp is not the original deployment time.",
-			required:    []string{"app"},
-			properties: map[string]expectedProperty{
-				"app": {typeName: "string", description: "Canonical deployed application name."},
-			},
-		},
+func TestPhase1CToolSchemasStaySimpleAndAccurate(t *testing.T) {
+	definitions := phase0CapabilityRegistry().toolDefinitions()
+	byName := map[string]toolDefinitionBody{}
+	for _, definition := range definitions {
+		if definition.Type != "function" {
+			t.Fatalf("tool %q type=%q", definition.Function.Name, definition.Type)
+		}
+		parameters := definition.Function.Parameters
+		if parameters["type"] != "object" ||
+			parameters["additionalProperties"] != false {
+
+			t.Fatalf("tool %q schema=%#v", definition.Function.Name, parameters)
+		}
+		if strings.Contains(
+			strings.ToLower(definition.Function.Description),
+			"contains no exact git commit",
+		) {
+			t.Fatalf("tool %q retains obsolete history wording", definition.Function.Name)
+		}
+		byName[definition.Function.Name] = definition.Function
 	}
 
-	definitions := agentToolDefinitions()
-	if len(definitions) != len(expected) {
-		t.Fatalf("definitions=%d want %d", len(definitions), len(expected))
-	}
-	for index, want := range expected {
-		got := definitions[index]
-		if got.Type != "function" || got.Function.Name != want.name || got.Function.Description != want.description {
-			t.Fatalf("definition %d identity mismatch: %+v", index, got)
+	for _, name := range []string{
+		"read_host_history",
+		"read_temperature_history",
+		"read_application_history",
+		"read_service_history",
+		"read_infrastructure_events",
+	} {
+		properties, ok := byName[name].Parameters["properties"].(map[string]any)
+		if !ok {
+			t.Fatalf("tool %q properties=%#v", name, byName[name].Parameters)
 		}
-		parameters := got.Function.Parameters
-		if parameters["type"] != "object" || parameters["additionalProperties"] != false {
-			t.Fatalf("definition %q object schema=%v", want.name, parameters)
-		}
-		if required, ok := parameters["required"].([]string); !ok || !reflect.DeepEqual(required, want.required) {
-			t.Fatalf("definition %q required=%#v want %#v", want.name, parameters["required"], want.required)
-		}
-		properties, ok := parameters["properties"].(map[string]any)
-		if !ok || len(properties) != len(want.properties) {
-			t.Fatalf("definition %q properties=%#v", want.name, parameters["properties"])
-		}
-		for propertyName, wantProperty := range want.properties {
-			property, ok := properties[propertyName].(map[string]any)
-			if !ok || !reflect.DeepEqual(property, map[string]any{
-				"type": wantProperty.typeName, "description": wantProperty.description,
-			}) {
-				t.Fatalf("definition %q property %q=%#v", want.name, propertyName, properties[propertyName])
+		for _, key := range []string{"range", "from", "to"} {
+			property, ok := properties[key].(map[string]any)
+			if !ok || property["type"] != "string" {
+				t.Fatalf("tool %q property %q=%#v", name, key, properties[key])
 			}
+		}
+	}
+
+	for name, maximum := range map[string]string{
+		"read_infrastructure_events": "500",
+		"read_database_backups":      "200",
+		"read_activity":              "200",
+	} {
+		properties := byName[name].Parameters["properties"].(map[string]any)
+		limit := properties["limit"].(map[string]any)
+		if limit["type"] != "integer" ||
+			!strings.Contains(limit["description"].(string), maximum) {
+
+			t.Fatalf("tool %q limit schema=%#v", name, limit)
 		}
 	}
 }
 
+func TestPhase1CReactorLabSchemasExposeOnlyFixedSelectors(t *testing.T) {
+	wantProperties := map[string][]string{
+		"get_platform_overview":      {},
+		"list_apps":                  {},
+		"get_app_context":            {"app"},
+		"read_host_history":          {"from", "range", "to"},
+		"read_temperature_history":   {"from", "range", "to"},
+		"read_application_history":   {"app", "from", "range", "to"},
+		"read_service_history":       {"from", "range", "service", "to"},
+		"read_infrastructure_events": {"from", "limit", "range", "to"},
+		"list_databases":             {},
+		"read_database_backups":      {"database_id", "limit"},
+		"read_activity":              {"limit"},
+		"read_recovery":              {},
+		"read_deployment_history":    {"app"},
+	}
+	seen := map[string]bool{}
+	for _, definition := range phase0CapabilityRegistry().toolDefinitions() {
+		want, relevant := wantProperties[definition.Function.Name]
+		if !relevant {
+			continue
+		}
+		seen[definition.Function.Name] = true
+		properties := definition.Function.Parameters["properties"].(map[string]any)
+		got := make([]string, 0, len(properties))
+		for name := range properties {
+			got = append(got, name)
+		}
+		sort.Strings(got)
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("tool %q properties=%v want %v", definition.Function.Name, got, want)
+		}
+	}
+	if len(seen) != len(wantProperties) {
+		t.Fatalf("checked %d fixed ReactorLab tools, want %d", len(seen), len(wantProperties))
+	}
+}
+
 func TestCapabilityExecutorRejectsUnknownTool(t *testing.T) {
-	result, summary, err := newCapabilityExecutor(&app{}).Execute(context.Background(), "write_repository_file", nil)
-	if err == nil || !strings.Contains(err.Error(), `unknown tool "write_repository_file"`) {
+	result, summary, err := newCapabilityExecutor(&app{}).Execute(
+		context.Background(),
+		"write_repository_file",
+		nil,
+	)
+	if err == nil ||
+		!strings.Contains(err.Error(), `unknown tool "write_repository_file"`) {
+
 		t.Fatalf("err=%v", err)
 	}
 	if result != nil || summary != "" {

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -21,6 +22,11 @@ func TestShouldUseAgentTools(t *testing.T) {
 		{"Where is the MyScheduler schedule route implemented?", true},
 		{"Why is MyScheduler login failing?", true},
 		{"Show me MyScheduler runtime logs", true},
+		{"How was Dell memory during the last hour?", true},
+		{"What happened around 3 PM?", true},
+		{"Is automatic recovery armed?", true},
+		{"Thanks, that helps.", false},
+		{"Thanks for sharing the program overview.", false},
 	}
 	for _, tc := range cases {
 		if got := shouldUseAgentTools(tc.message); got != tc.want {
@@ -29,16 +35,89 @@ func TestShouldUseAgentTools(t *testing.T) {
 	}
 }
 
+func TestExactDeploymentIdentityRequiresTypedEvidence(t *testing.T) {
+	for _, message := range []string{
+		"What commit is MyScheduler deployed on?",
+		"Which deployment SHA is active?",
+		"What branch was this release deployed from?",
+		"Is the deployed app on the same version as the checkout?",
+	} {
+		if !requiresTypedDeploymentIdentity(message) {
+			t.Fatalf("message did not require typed identity: %q", message)
+		}
+	}
+	if requiresTypedDeploymentIdentity("Is MyScheduler healthy?") {
+		t.Fatal("ordinary health question unexpectedly required exact identity")
+	}
+	if requiresTypedDeploymentIdentity("Please share deployment status.") {
+		t.Fatal("sha trigger matched inside an ordinary word")
+	}
+	if requiresRepositoryEvidence(
+		"What exact source commit is MyScheduler deployed from?",
+	) {
+		t.Fatal("exact deployed source question requested repository code evidence")
+	}
+}
+
+func TestAgentPromptDescribesTypedEvidenceAndUnknownProvenance(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(
+		response http.ResponseWriter,
+		request *http.Request,
+	) {
+		if request.URL.Path != "/api/v1/deployments" {
+			t.Fatalf("path=%q", request.URL.Path)
+		}
+		_, _ = response.Write([]byte(`{"deployments":[]}`))
+	}))
+	defer server.Close()
+	a := &app{reactorURL: server.URL, client: server.Client()}
+	prompt, _ := a.agentSystemPrompt(
+		context.Background(),
+		"What was deployed?",
+		nil,
+	)
+	for _, required := range []string{
+		"current and historical ReactorLab state",
+		"source.commitSha is authoritative",
+		"local repository commit is separate evidence",
+		"exact deployed source is unknown",
+		"archivedAt",
+		"activatedAt",
+		"Correlation is not causation",
+		"read-only",
+	} {
+		if !strings.Contains(prompt, required) {
+			t.Fatalf("prompt lacks %q: %s", required, prompt)
+		}
+	}
+	if strings.Contains(
+		strings.ToLower(prompt),
+		"does not contain an exact deployed git commit",
+	) {
+		t.Fatal("prompt retains obsolete deployment-history wording")
+	}
+}
+
 func TestAgentToolsAreReadOnly(t *testing.T) {
 	allowed := map[string]bool{
-		"list_apps":                 true,
-		"get_app_context":           true,
-		"list_repository_directory": true,
-		"search_repository":         true,
-		"read_repository_file":      true,
-		"read_runtime_logs":         true,
-		"read_deployment_logs":      true,
-		"read_deployment_history":   true,
+		"get_platform_overview":      true,
+		"list_apps":                  true,
+		"get_app_context":            true,
+		"read_host_history":          true,
+		"read_temperature_history":   true,
+		"read_application_history":   true,
+		"read_service_history":       true,
+		"read_infrastructure_events": true,
+		"list_databases":             true,
+		"read_database_backups":      true,
+		"read_activity":              true,
+		"read_recovery":              true,
+		"list_repository_directory":  true,
+		"search_repository":          true,
+		"read_repository_file":       true,
+		"read_runtime_logs":          true,
+		"read_deployment_logs":       true,
+		"read_deployment_history":    true,
 	}
 	defs := agentToolDefinitions()
 	if len(defs) != len(allowed) {
@@ -49,7 +128,7 @@ func TestAgentToolsAreReadOnly(t *testing.T) {
 			t.Fatalf("unexpected agent tool %q", def.Function.Name)
 		}
 		lower := strings.ToLower(def.Function.Name + " " + def.Function.Description)
-		for _, forbidden := range []string{"restart", "redeploy", "delete", "write file", "shell"} {
+		for _, forbidden := range []string{"redeploy", "delete", "write file", "shell command"} {
 			if strings.Contains(lower, forbidden) {
 				t.Fatalf("tool %q contains forbidden capability term %q", def.Function.Name, forbidden)
 			}
@@ -87,6 +166,57 @@ func TestEncodeAgentToolResultCapsContext(t *testing.T) {
 	}
 	if !strings.Contains(got, "truncated") {
 		t.Fatalf("expected truncation marker")
+	}
+}
+
+func TestReactorLabMetricCompactionKeepsValidExactNewestPoints(t *testing.T) {
+	points := make([]reactorLabHostPoint, reactorLabMaxMetricPoints)
+	for index := range points {
+		points[index] = reactorLabHostPoint{
+			Timestamp:   reactorLabTestNow.Add(time.Duration(index) * time.Second),
+			SampleCount: 1,
+			CPUAverage:  pointerTo(float64(index) + 0.125),
+		}
+	}
+	history := reactorLabHostHistory{
+		Window:      reactorLabTestWindow(),
+		Points:      points,
+		TotalPoints: len(points),
+	}
+	compacted := compactAgentToolResult(
+		"read_host_history",
+		history,
+	).(reactorLabHostHistory)
+	if !compacted.Truncated || compacted.TotalPoints != len(points) ||
+		len(compacted.Points) != 6 ||
+		*compacted.Points[len(compacted.Points)-1].CPUAverage !=
+			float64(reactorLabMaxMetricPoints-1)+0.125 {
+
+		t.Fatalf("compacted=%+v", compacted)
+	}
+	encoded := encodeAgentToolResult(compacted)
+	if !json.Valid([]byte(encoded)) ||
+		len([]rune(encoded)) > agentToolResultMaxRunes {
+
+		t.Fatalf("encoded compact result invalid or oversized: %s", encoded)
+	}
+}
+
+func TestReactorLabAppCompactionPreservesPreexistingTotal(t *testing.T) {
+	apps := make([]reactorLabAppSummary, reactorLabMaxToolApps)
+	for index := range apps {
+		apps[index].App = fmt.Sprintf("app-%03d", index)
+	}
+	compacted := compactAgentToolResult(
+		"list_apps",
+		reactorLabAppListResult{
+			Apps: apps, TotalApps: 500, Truncated: true,
+		},
+	).(reactorLabAppListResult)
+	if len(compacted.Apps) != 8 || compacted.TotalApps != 500 ||
+		!compacted.Truncated {
+
+		t.Fatalf("compacted=%+v", compacted)
 	}
 }
 

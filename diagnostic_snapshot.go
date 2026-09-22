@@ -375,6 +375,27 @@ func asksForDeployedCommit(message string) bool {
 		(messageContainsTerm(message, "deployed") || messageContainsTerm(message, "deployment"))
 }
 
+func requiresTypedDeploymentIdentity(message string) bool {
+	message = strings.ToLower(message)
+	if asksForDeployedCommit(message) ||
+		strings.Contains(message, "same version") {
+
+		return true
+	}
+	deploymentIdentity := messageContainsTerm(message, "deploy") ||
+		messageContainsTerm(message, "deployment") ||
+		messageContainsTerm(message, "deployments") ||
+		messageContainsTerm(message, "deployed") ||
+		messageContainsTerm(message, "release") ||
+		messageContainsTerm(message, "version")
+	exactIdentity := messageContainsTerm(message, "commit") ||
+		messageContainsTerm(message, "sha") ||
+		messageContainsTerm(message, "branch") ||
+		strings.Contains(message, "source identity") ||
+		strings.Contains(message, "exact source")
+	return deploymentIdentity && exactIdentity
+}
+
 func commitValuesMatch(left, right string) bool {
 	left = strings.TrimSpace(left)
 	right = strings.TrimSpace(right)
@@ -396,7 +417,9 @@ func formatServiceStates(services []diagnosticService) string {
 }
 
 func (a *app) handleDeterministicDiagnosticLookup(w http.ResponseWriter, r *http.Request, message string) bool {
-	if !isExplicitDiagnosticLookup(message) {
+	if requiresTypedDeploymentIdentity(message) ||
+		!isExplicitDiagnosticLookup(message) {
+
 		return false
 	}
 	snapshot, ok := a.resolveDiagnosticSnapshot(r.Context(), message)
@@ -407,7 +430,9 @@ func (a *app) handleDeterministicDiagnosticLookup(w http.ResponseWriter, r *http
 }
 
 func (a *app) handleConversationDiagnosticLookup(w http.ResponseWriter, r *http.Request, message string, history []storedMessage) bool {
-	if !isExplicitDiagnosticLookup(message) {
+	if requiresTypedDeploymentIdentity(message) ||
+		!isExplicitDiagnosticLookup(message) {
+
 		return false
 	}
 
