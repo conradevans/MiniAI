@@ -171,12 +171,16 @@ func (a *app) handleAgentChatStream(w http.ResponseWriter, r *http.Request, req 
 			return
 		}
 		plannerMetrics = planner
-		messages = append(messages, planner.Message)
 		calls := planner.Message.ToolCalls
 		if len(calls) == 0 {
-			plannerContent = strings.TrimSpace(planner.Message.Content)
+			if !usedAnyTool {
+				plannerContent = strings.TrimSpace(
+					planner.Message.Content,
+				)
+			}
 			break
 		}
+		messages = append(messages, planner.Message)
 
 		for _, call := range calls {
 			if !budget.canCallTool(toolCallsUsed) {
@@ -257,31 +261,9 @@ func (a *app) handleAgentChatStream(w http.ResponseWriter, r *http.Request, req 
 		return
 	}
 
-	if plannerContent != "" {
-		emitBufferedAnswer(w, flusher, plannerContent)
-		tokensPerSecond := 0.0
-		if plannerMetrics.EvalDuration > 0 {
-			tokensPerSecond = float64(plannerMetrics.EvalCount) / (float64(plannerMetrics.EvalDuration) / 1e9)
-		}
-		sendSSE(w, "done", map[string]any{
-			"model":             policy.Model,
-			"mode":              policy.Mode,
-			"agent":             true,
-			"tool_calls":        toolCallsUsed,
-			"planner_calls":     plannerCalls,
-			"tokens":            plannerMetrics.EvalCount,
-			"tokens_per_second": round2(tokensPerSecond),
-			"load_seconds":      round2(float64(plannerMetrics.LoadDuration) / 1e9),
-			"total_seconds":     round2(float64(plannerMetrics.TotalDuration) / 1e9),
-			"agent_seconds":     round2(time.Since(agentStarted).Seconds()),
-		})
-		flusher.Flush()
-		return
-	}
-
 	messages = append(messages, chatMessage{
 		Role:    "system",
-		Content: "Tool gathering is complete. Give the user the final answer now. Use only supported evidence, stay concise unless detail was requested, and do not request more tools.",
+		Content: "Tool gathering is complete. Give the user the final answer now. Use only supported evidence, stay concise unless detail was requested, and do not request more tools. Respond directly without planning or tool-selection narration, and never include <think> tags.",
 	})
 	if err := a.streamAgentFinal(r.Context(), w, flusher, policy, messages, toolCallsUsed, plannerCalls, agentStarted); err != nil {
 		sendSSE(w, "error", map[string]string{"error": err.Error()})

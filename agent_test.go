@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -95,6 +97,280 @@ func TestAgentPromptDescribesTypedEvidenceAndUnknownProvenance(t *testing.T) {
 		"does not contain an exact deployed git commit",
 	) {
 		t.Fatal("prompt retains obsolete deployment-history wording")
+	}
+}
+
+type agentStreamCapture struct {
+	answer string
+	done   map[string]any
+}
+
+func decodeAgentStream(t *testing.T, body string) agentStreamCapture {
+	t.Helper()
+	var capture agentStreamCapture
+	event := ""
+	scanner := bufio.NewScanner(strings.NewReader(body))
+	for scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case strings.HasPrefix(line, "event: "):
+			event = strings.TrimPrefix(line, "event: ")
+		case strings.HasPrefix(line, "data: "):
+			payload := []byte(strings.TrimPrefix(line, "data: "))
+			switch event {
+			case "token":
+				var token map[string]string
+				if err := json.Unmarshal(payload, &token); err != nil {
+					t.Fatalf("decode token event: %v", err)
+				}
+				capture.answer += token["content"]
+			case "done":
+				if err := json.Unmarshal(payload, &capture.done); err != nil {
+					t.Fatalf("decode done event: %v", err)
+				}
+			}
+			event = ""
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("scan SSE stream: %v", err)
+	}
+	return capture
+}
+
+func newAgentHandoffReactorServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(
+		response http.ResponseWriter,
+		request *http.Request,
+	) {
+		if request.Method != http.MethodGet {
+			t.Errorf("ReactorLab method=%s want GET", request.Method)
+			http.Error(response, "unexpected method", http.StatusMethodNotAllowed)
+			return
+		}
+		switch request.URL.Path {
+		case "/api/v1/deployments":
+			_, _ = response.Write([]byte(`{"deployments":[]}`))
+		case "/internal/miniai/v1/overview":
+			_ = json.NewEncoder(response).Encode(reactorLabOverview{
+				CollectedAt: time.Date(
+					2026, 9, 22, 18, 0, 0, 0, time.UTC,
+				),
+				System: reactorLabSection[reactorLabSystemSnapshot]{
+					Available: false, Error: "system_metrics_unavailable",
+				},
+				Recovery: reactorLabSection[reactorLabRecovery]{
+					Available: false, Error: "recovery_unavailable",
+				},
+				Deployments: reactorLabSection[reactorLabDeploymentList]{
+					Available: false, Error: "deployment_source_unavailable",
+				},
+				Databases: reactorLabSection[reactorLabDatabaseList]{
+					Available: false, Error: "database_source_unavailable",
+				},
+				Observability: reactorLabSection[reactorLabObservabilityState]{
+					Available: false, Error: "observability_unavailable",
+				},
+			})
+		default:
+			t.Errorf("unexpected ReactorLab path %q", request.URL.Path)
+			http.NotFound(response, request)
+		}
+	}))
+}
+
+func TestAgentNoToolPlannerContentRemainsDirectAnswer(t *testing.T) {
+	reactor := newAgentHandoffReactorServer(t)
+	defer reactor.Close()
+	var requests []chatAPIRequest
+	ollama := httptest.NewServer(http.HandlerFunc(func(
+		response http.ResponseWriter,
+		request *http.Request,
+	) {
+		var input chatAPIRequest
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+			t.Errorf("decode Ollama request: %v", err)
+			http.Error(response, "decode failed", http.StatusBadRequest)
+			return
+		}
+		requests = append(requests, input)
+		_ = json.NewEncoder(response).Encode(chatAPIResponse{
+			Message: chatMessage{Content: "Direct planner answer."},
+			Done:    true,
+		})
+	}))
+	defer ollama.Close()
+
+	a := &app{
+		ollamaURL: ollama.URL, reactorURL: reactor.URL,
+		client: ollama.Client(),
+	}
+	recorder := httptest.NewRecorder()
+	a.handleAgentChatStream(
+		recorder,
+		httptest.NewRequest(http.MethodPost, "/api/v1/chat/stream", nil),
+		chatRequest{Message: "Give me a direct answer."},
+		modelPolicy{Model: fallbackModel, Mode: "fallback"},
+		nil,
+	)
+
+	capture := decodeAgentStream(t, recorder.Body.String())
+	if capture.answer != "Direct planner answer." {
+		t.Fatalf("answer=%q", capture.answer)
+	}
+	if len(requests) != 1 || requests[0].Stream ||
+		int(number(requests[0].Options["num_predict"])) != 512 {
+
+		t.Fatalf("Ollama requests=%+v", requests)
+	}
+	if int(number(capture.done["tool_calls"])) != 0 ||
+		int(number(capture.done["planner_calls"])) != 1 {
+
+		t.Fatalf("done=%v", capture.done)
+	}
+}
+
+type agentToolHandoffResult struct {
+	stream   agentStreamCapture
+	requests []chatAPIRequest
+}
+
+func runAgentToolHandoff(
+	t *testing.T,
+	terminalPlannerContent string,
+) agentToolHandoffResult {
+	t.Helper()
+	reactor := newAgentHandoffReactorServer(t)
+	defer reactor.Close()
+	var (
+		mu       sync.Mutex
+		requests []chatAPIRequest
+	)
+	ollama := httptest.NewServer(http.HandlerFunc(func(
+		response http.ResponseWriter,
+		request *http.Request,
+	) {
+		var input chatAPIRequest
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+			t.Errorf("decode Ollama request: %v", err)
+			http.Error(response, "decode failed", http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		requests = append(requests, input)
+		requestNumber := len(requests)
+		mu.Unlock()
+
+		switch requestNumber {
+		case 1:
+			_ = json.NewEncoder(response).Encode(chatAPIResponse{
+				Message: chatMessage{ToolCalls: []toolCall{{
+					Type: "function",
+					Function: toolFunction{
+						Name:      "get_platform_overview",
+						Arguments: map[string]any{},
+					},
+				}}},
+				Done: true,
+			})
+		case 2:
+			_ = json.NewEncoder(response).Encode(chatAPIResponse{
+				Message: chatMessage{Content: terminalPlannerContent},
+				Done:    true,
+			})
+		case 3:
+			_ = json.NewEncoder(response).Encode(chatAPIResponse{
+				Message: chatMessage{Content: "Final answer from evidence."},
+				Done:    true,
+			})
+		default:
+			t.Errorf("unexpected Ollama request %d", requestNumber)
+			http.Error(response, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer ollama.Close()
+
+	a := &app{
+		ollamaURL: ollama.URL, reactorURL: reactor.URL,
+		client: ollama.Client(),
+	}
+	recorder := httptest.NewRecorder()
+	a.handleAgentChatStream(
+		recorder,
+		httptest.NewRequest(http.MethodPost, "/api/v1/chat/stream", nil),
+		chatRequest{Message: "How is the Dell doing?"},
+		modelPolicy{Model: fallbackModel, Mode: "fallback"},
+		nil,
+	)
+
+	mu.Lock()
+	requestCopy := append([]chatAPIRequest(nil), requests...)
+	mu.Unlock()
+	return agentToolHandoffResult{
+		stream:   decodeAgentStream(t, recorder.Body.String()),
+		requests: requestCopy,
+	}
+}
+
+func TestAgentToolThenNoMoreToolsUsesDedicatedFinalAnswer(t *testing.T) {
+	result := runAgentToolHandoff(
+		t,
+		"Planner synthesis that must remain internal.",
+	)
+	if result.stream.answer != "Final answer from evidence." {
+		t.Fatalf("answer=%q", result.stream.answer)
+	}
+	if len(result.requests) != 3 ||
+		result.requests[0].Stream || result.requests[1].Stream ||
+		!result.requests[2].Stream {
+
+		t.Fatalf("requests=%+v", result.requests)
+	}
+	if int(number(result.stream.done["tool_calls"])) != 1 ||
+		int(number(result.stream.done["planner_calls"])) != 2 {
+
+		t.Fatalf("done=%v", result.stream.done)
+	}
+	finalMessages := result.requests[2].Messages
+	toolEvidenceFound := false
+	finalInstructionFound := false
+	for _, message := range finalMessages {
+		if message.ToolName == "get_platform_overview" {
+			toolEvidenceFound = true
+		}
+		if message.Role == "system" &&
+			strings.Contains(message.Content, "Tool gathering is complete") {
+
+			finalInstructionFound = true
+		}
+		if strings.Contains(message.Content, "Planner synthesis") {
+			t.Fatalf("terminal planner content polluted final prompt: %+v", finalMessages)
+		}
+	}
+	if !toolEvidenceFound || !finalInstructionFound {
+		t.Fatalf("final messages missing evidence/instruction: %+v", finalMessages)
+	}
+}
+
+func TestAgentPlannerReasoningIsNeverUserFacingAfterToolUse(t *testing.T) {
+	plannerReasoning := "Okay, let me process the user question and tool response... </think>"
+	result := runAgentToolHandoff(t, plannerReasoning)
+	if strings.Contains(result.stream.answer, "Okay, let me process") ||
+		strings.Contains(result.stream.answer, "</think>") ||
+		strings.Contains(result.stream.answer, plannerReasoning) {
+
+		t.Fatalf("planner reasoning leaked into answer: %q", result.stream.answer)
+	}
+	if result.stream.answer != "Final answer from evidence." {
+		t.Fatalf("answer=%q", result.stream.answer)
+	}
+	for _, message := range result.requests[2].Messages {
+		if strings.Contains(message.Content, "Okay, let me process") ||
+			strings.Contains(message.Content, "</think>") {
+
+			t.Fatalf("planner reasoning leaked into final prompt: %+v", result.requests[2].Messages)
+		}
 	}
 }
 
