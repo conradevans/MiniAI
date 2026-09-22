@@ -27,7 +27,7 @@ func (a *app) callAgentPlannerWithKeepalive(ctx context.Context, model string, m
 		KeepAlive: modelKeepAlive,
 		Options: a.ollamaRequestOptions(model, map[string]any{
 			"num_ctx":     8192,
-			"num_predict": 192,
+			"num_predict": 512,
 		}),
 	}
 	body, err := json.Marshal(reqBody)
