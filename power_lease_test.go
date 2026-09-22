@@ -60,7 +60,7 @@ func TestCurated8BPowerLeaseAcquiresBeforeModelAndRestores(t *testing.T) {
 		}
 		return powerHelperRestored, nil
 	}
-	ran, err := a.with8BPowerLease(context.Background(), primaryModel, func() error {
+	ran, err := a.withProtectedModelPowerLease(context.Background(), primaryModel, func() error {
 		if !manager.Active() {
 			t.Fatal("8B model work ran without an active CPU power lease")
 		}
@@ -86,7 +86,7 @@ func TestGeneral8BLeaseCoversPlannerRoundsAndFinal(t *testing.T) {
 	runner := &fakePowerHelperRunner{}
 	a := &app{powerLeaseManager: newCPUPowerLeaseManager(runner, nil)}
 	work := []string{}
-	ran, err := a.with8BPowerLease(context.Background(), primaryModel, func() error {
+	ran, err := a.withProtectedModelPowerLease(context.Background(), primaryModel, func() error {
 		work = append(work, "planner_1", "planner_2", "final")
 		return nil
 	})
@@ -98,37 +98,71 @@ func TestGeneral8BLeaseCoversPlannerRoundsAndFinal(t *testing.T) {
 	}
 }
 
-func Test4BModelWorkDoesNotUsePowerLease(t *testing.T) {
+func TestFallback4BPowerLeaseAcquiresBeforeModelAndRestores(t *testing.T) {
 	runner := &fakePowerHelperRunner{}
-	a := &app{powerLeaseManager: newCPUPowerLeaseManager(runner, nil)}
+	manager := newCPUPowerLeaseManager(runner, nil)
+	a := &app{powerLeaseManager: manager}
 	modelCalled := false
-	ran, err := a.with8BPowerLease(context.Background(), fallbackModel, func() error {
+	ran, err := a.withProtectedModelPowerLease(context.Background(), fallbackModel, func() error {
+		if !manager.Active() {
+			t.Fatal("4B model work ran without an active CPU power lease")
+		}
 		modelCalled = true
 		return nil
 	})
-	if !ran || err != nil || !modelCalled || len(runner.commands()) != 0 {
+	if !ran || err != nil || !modelCalled {
 		t.Fatalf("ran=%v model_called=%v helper_calls=%v err=%v", ran, modelCalled, runner.commands(), err)
+	}
+	if got := runner.commands(); !reflect.DeepEqual(got, []powerHelperCommand{powerHelperEnter, powerHelperRestore}) {
+		t.Fatalf("helper calls=%v", got)
+	}
+	if manager.Active() {
+		t.Fatal("lease remained active after 4B model work")
 	}
 }
 
-func TestAcquireFailurePrevents8BModelWork(t *testing.T) {
-	runner := &fakePowerHelperRunner{handler: func(_ context.Context, command powerHelperCommand) (powerHelperResult, error) {
-		if command == powerHelperEnter {
-			return "", errors.New("injected acquire failure")
-		}
-		return powerHelperRestored, nil
-	}}
-	a := &app{powerLeaseManager: newCPUPowerLeaseManager(runner, nil)}
+func TestUnsupportedModelDoesNotUsePowerLease(t *testing.T) {
+	runner := &fakePowerHelperRunner{}
+	manager := newCPUPowerLeaseManager(runner, nil)
+	a := &app{powerLeaseManager: manager}
 	modelCalled := false
-	ran, err := a.with8BPowerLease(context.Background(), primaryModel, func() error {
+	ran, err := a.withProtectedModelPowerLease(context.Background(), "qwen3:unrelated", func() error {
 		modelCalled = true
 		return nil
 	})
-	if ran || err == nil || modelCalled || !a.powerLeaseManager.isBlocked() {
-		t.Fatalf("ran=%v model_called=%v blocked=%v err=%v", ran, modelCalled, a.powerLeaseManager.isBlocked(), err)
+	if !ran || err != nil || !modelCalled {
+		t.Fatalf("ran=%v model_called=%v err=%v", ran, modelCalled, err)
 	}
-	if got := runner.commands(); !reflect.DeepEqual(got, []powerHelperCommand{powerHelperEnter}) {
-		t.Fatalf("helper calls=%v", got)
+	if got := runner.commands(); len(got) != 0 {
+		t.Fatalf("unsupported model invoked privileged helper: %v", got)
+	}
+	if manager.Active() {
+		t.Fatal("unsupported model activated CPU power lease")
+	}
+}
+
+func TestAcquireFailurePreventsSupportedModelWork(t *testing.T) {
+	for _, model := range []string{primaryModel, fallbackModel} {
+		t.Run(model, func(t *testing.T) {
+			runner := &fakePowerHelperRunner{handler: func(_ context.Context, command powerHelperCommand) (powerHelperResult, error) {
+				if command == powerHelperEnter {
+					return "", errors.New("injected acquire failure")
+				}
+				return powerHelperRestored, nil
+			}}
+			a := &app{powerLeaseManager: newCPUPowerLeaseManager(runner, nil)}
+			modelCalled := false
+			ran, err := a.withProtectedModelPowerLease(context.Background(), model, func() error {
+				modelCalled = true
+				return nil
+			})
+			if ran || err == nil || modelCalled || !a.powerLeaseManager.isBlocked() {
+				t.Fatalf("ran=%v model_called=%v blocked=%v err=%v", ran, modelCalled, a.powerLeaseManager.isBlocked(), err)
+			}
+			if got := runner.commands(); !reflect.DeepEqual(got, []powerHelperCommand{powerHelperEnter}) {
+				t.Fatalf("helper calls=%v", got)
+			}
+		})
 	}
 }
 
@@ -136,7 +170,7 @@ func Test8BInferenceFailureStillRestores(t *testing.T) {
 	runner := &fakePowerHelperRunner{}
 	a := &app{powerLeaseManager: newCPUPowerLeaseManager(runner, nil)}
 	modelErr := errors.New("injected Ollama failure")
-	ran, err := a.with8BPowerLease(context.Background(), primaryModel, func() error { return modelErr })
+	ran, err := a.withProtectedModelPowerLease(context.Background(), primaryModel, func() error { return modelErr })
 	if !ran || !errors.Is(err, modelErr) {
 		t.Fatalf("ran=%v err=%v", ran, err)
 	}
@@ -160,7 +194,7 @@ func TestRequestCancellationCannotCancelRestoration(t *testing.T) {
 		}
 	}}
 	a := &app{powerLeaseManager: newCPUPowerLeaseManager(runner, nil)}
-	ran, err := a.with8BPowerLease(requestContext, primaryModel, func() error {
+	ran, err := a.withProtectedModelPowerLease(requestContext, primaryModel, func() error {
 		cancel()
 		return requestContext.Err()
 	})
@@ -181,7 +215,7 @@ func TestPanicUnwindingStillRestores(t *testing.T) {
 				t.Fatal("expected injected panic")
 			}
 		}()
-		_, _ = a.with8BPowerLease(context.Background(), primaryModel, func() error {
+		_, _ = a.withProtectedModelPowerLease(context.Background(), primaryModel, func() error {
 			panic("injected model panic")
 		})
 	}()
@@ -190,7 +224,7 @@ func TestPanicUnwindingStillRestores(t *testing.T) {
 	}
 }
 
-func TestRestoreFailureBlocksFurther8BWork(t *testing.T) {
+func TestRestoreFailureBlocksFurtherSupportedModelWork(t *testing.T) {
 	runner := &fakePowerHelperRunner{handler: func(_ context.Context, command powerHelperCommand) (powerHelperResult, error) {
 		if command == powerHelperEnter {
 			return powerHelperEntered, nil
@@ -199,12 +233,12 @@ func TestRestoreFailureBlocksFurther8BWork(t *testing.T) {
 	}}
 	manager := newCPUPowerLeaseManager(runner, nil)
 	a := &app{powerLeaseManager: manager}
-	ran, err := a.with8BPowerLease(context.Background(), primaryModel, func() error { return nil })
+	ran, err := a.withProtectedModelPowerLease(context.Background(), primaryModel, func() error { return nil })
 	if !ran || err == nil || !manager.isBlocked() {
 		t.Fatalf("ran=%v blocked=%v err=%v", ran, manager.isBlocked(), err)
 	}
 	modelCalled := false
-	ran, err = a.with8BPowerLease(context.Background(), primaryModel, func() error {
+	ran, err = a.withProtectedModelPowerLease(context.Background(), fallbackModel, func() error {
 		modelCalled = true
 		return nil
 	})
@@ -220,7 +254,7 @@ func TestStructuredResponseFailureStillRestores(t *testing.T) {
 	runner := &fakePowerHelperRunner{}
 	a := &app{powerLeaseManager: newCPUPowerLeaseManager(runner, nil)}
 	formatErr := errors.New("invalid structured response")
-	ran, err := a.with8BPowerLease(context.Background(), primaryModel, func() error { return formatErr })
+	ran, err := a.withProtectedModelPowerLease(context.Background(), primaryModel, func() error { return formatErr })
 	if !ran || !errors.Is(err, formatErr) {
 		t.Fatalf("ran=%v err=%v", ran, err)
 	}
@@ -284,29 +318,31 @@ func TestStartupRecoveryIsAttempted(t *testing.T) {
 	}}
 	manager := initializeCPUPowerLeaseManager(runner, nil)
 	if manager.isBlocked() {
-		t.Fatal("successful recovery left 8B blocked")
+		t.Fatal("successful recovery left protected models blocked")
 	}
 	if got := runner.commands(); !reflect.DeepEqual(got, []powerHelperCommand{powerHelperRecover}) {
 		t.Fatalf("startup helper calls=%v", got)
 	}
 }
 
-func TestRecoveryFailureBlocks8BButNotDeterministicDiagnostics(t *testing.T) {
+func TestRecoveryFailureBlocksSupportedModelsButNotDeterministicDiagnostics(t *testing.T) {
 	runner := &fakePowerHelperRunner{handler: func(_ context.Context, command powerHelperCommand) (powerHelperResult, error) {
 		return "", errors.New("injected recovery failure")
 	}}
 	manager := initializeCPUPowerLeaseManager(runner, nil)
 	if !manager.isBlocked() {
-		t.Fatal("recovery failure did not block 8B")
+		t.Fatal("recovery failure did not block protected models")
 	}
-	modelCalled := false
 	a := &app{powerLeaseManager: manager}
-	ran, err := a.with8BPowerLease(context.Background(), primaryModel, func() error {
-		modelCalled = true
-		return nil
-	})
-	if ran || err == nil || modelCalled {
-		t.Fatalf("ran=%v model_called=%v err=%v", ran, modelCalled, err)
+	for _, model := range []string{primaryModel, fallbackModel} {
+		modelCalled := false
+		ran, err := a.withProtectedModelPowerLease(context.Background(), model, func() error {
+			modelCalled = true
+			return nil
+		})
+		if ran || err == nil || modelCalled {
+			t.Fatalf("model=%q ran=%v model_called=%v err=%v", model, ran, modelCalled, err)
+		}
 	}
 
 	diagnosticApp, cleanup := newDiagnosticTestApp(t, []any{healthyMySchedulerDeployment()}, nil, "", "")

@@ -42,7 +42,7 @@ const (
 
 var (
 	errPowerHelperFailed     = errors.New("MiniAI CPU power helper failed")
-	errPowerLeaseUnavailable = errors.New("MiniAI 8B CPU power lease is unavailable")
+	errPowerLeaseUnavailable = errors.New("MiniAI protected-model CPU power lease is unavailable")
 	errPowerLeaseStateLost   = errors.New("MiniAI CPU power lease state was not available during restoration")
 )
 
@@ -171,7 +171,7 @@ func (m *cpuPowerLeaseManager) Recover(ctx context.Context) error {
 	result, err := m.runner.Run(ctx, powerHelperRecover)
 	if err != nil || (result != powerHelperRecovered && result != powerHelperNoActiveLease) {
 		m.setBlocked(true)
-		m.safeLog("MiniAI CPU power recovery: cpu_power_recovery=failed 8b_inference=blocked")
+		m.safeLog("MiniAI CPU power recovery: cpu_power_recovery=failed protected_model_inference=blocked")
 		return errPowerLeaseUnavailable
 	}
 	m.setBlocked(false)
@@ -183,8 +183,12 @@ func (m *cpuPowerLeaseManager) Recover(ctx context.Context) error {
 	return nil
 }
 
+func modelRequiresCPUPowerLease(model string) bool {
+	return sameModel(model, primaryModel) || sameModel(model, fallbackModel)
+}
+
 func (m *cpuPowerLeaseManager) Acquire(ctx context.Context, model string) (*cpuPowerLease, error) {
-	if !sameModel(model, primaryModel) {
+	if !modelRequiresCPUPowerLease(model) {
 		return &cpuPowerLease{}, nil
 	}
 	if m == nil || m.runner == nil || m.isBlocked() {
@@ -205,7 +209,7 @@ func (m *cpuPowerLeaseManager) Acquire(ctx context.Context, model string) (*cpuP
 	if err != nil || result != powerHelperEntered {
 		m.setBlocked(true)
 		m.slot <- struct{}{}
-		m.safeLog("MiniAI CPU power lease: cpu_power_lease=acquire_failed 8b_inference=blocked")
+		m.safeLog("MiniAI CPU power lease: cpu_power_lease=acquire_failed protected_model_inference=blocked")
 		return nil, errPowerLeaseUnavailable
 	}
 	m.stateMu.Lock()
@@ -272,7 +276,7 @@ func (l *cpuPowerLease) Restore() error {
 		}
 		manager.stateMu.Unlock()
 		if err != nil {
-			manager.safeLog("MiniAI CPU power lease: cpu_power_lease=restore_failed 8b_inference=blocked")
+			manager.safeLog("MiniAI CPU power lease: cpu_power_lease=restore_failed protected_model_inference=blocked")
 			l.err = errPowerLeaseUnavailable
 		} else {
 			manager.safeLog("MiniAI CPU power lease: cpu_power_lease=restored cpu_power_profile=normal_restored")
@@ -282,8 +286,8 @@ func (l *cpuPowerLease) Restore() error {
 	return l.err
 }
 
-func (a *app) with8BPowerLease(ctx context.Context, model string, work func() error) (ran bool, err error) {
-	if !sameModel(model, primaryModel) {
+func (a *app) withProtectedModelPowerLease(ctx context.Context, model string, work func() error) (ran bool, err error) {
+	if !modelRequiresCPUPowerLease(model) {
 		return true, work()
 	}
 	if a == nil || a.powerLeaseManager == nil {
@@ -309,14 +313,14 @@ func initializeCPUPowerLeaseManager(runner powerHelperRunner, logf func(string, 
 	ctx, cancel := context.WithTimeout(context.Background(), powerHelperCommandTimeout)
 	defer cancel()
 	if err := manager.Recover(ctx); err != nil && logf != nil {
-		logf("MiniAI CPU power recovery unavailable; Qwen 8B inference is blocked until recovery succeeds")
+		logf("MiniAI CPU power recovery unavailable; protected MiniAI model inference is blocked until recovery succeeds")
 	}
 	return manager
 }
 
 func logPowerLeaseError(err error) {
 	if err != nil {
-		log.Printf("MiniAI CPU power lease cleanup failed; Qwen 8B inference is blocked")
+		log.Printf("MiniAI CPU power lease cleanup failed; protected MiniAI model inference is blocked")
 	}
 }
 
@@ -325,10 +329,10 @@ func powerLeaseUnavailablePolicy(policy modelPolicy) modelPolicy {
 		Allowed: false,
 		Model:   policy.Model,
 		Mode:    "blocked",
-		Reason:  "Qwen 8B requires the temporary CPU low-power lease, which is unavailable",
+		Reason:  "The selected MiniAI model requires the temporary CPU low-power lease, which is unavailable",
 	}
 }
 
-func powerLeaseUnavailableMessage() string {
-	return fmt.Sprintf("MiniAI cannot run %s until its CPU low-power lease is available", primaryModel)
+func powerLeaseUnavailableMessage(model string) string {
+	return fmt.Sprintf("MiniAI cannot run %s until its CPU low-power lease is available", model)
 }

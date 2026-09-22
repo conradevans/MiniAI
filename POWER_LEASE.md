@@ -1,11 +1,11 @@
-# MiniAI Qwen 8B CPU power lease
+# MiniAI protected-model CPU power lease
 
-MiniAI remains an unprivileged service. Immediately before selected Qwen 8B work,
-it invokes the fixed root-owned helper through noninteractive sudo. The helper
-saves the current CPU policy values in `/run/miniai-power/lease.json`, applies
-`energy_performance_preference=power` and `scaling_max_freq=3000000`, and restores
-the exact snapshot after inference. Qwen 4B and deterministic responses do not
-invoke the helper.
+MiniAI remains an unprivileged service. Immediately before Qwen 8B or Qwen 4B
+work, it invokes the fixed root-owned helper through noninteractive sudo. The
+helper saves the current CPU policy values in `/run/miniai-power/lease.json`,
+applies `energy_performance_preference=power` and
+`scaling_max_freq=3000000`, and restores the exact snapshot after inference.
+Deterministic responses do not invoke the helper.
 
 The helper accepts exactly one of `enter`, `restore`, `recover`, or `status`. Its
 sysfs root, control names, low-power values, state path, and lock path are
@@ -67,7 +67,7 @@ sudo /usr/local/libexec/miniai-power-helper recover
 ```
 
 MiniAI invokes `recover` before opening its database or accepting requests. A
-recovery failure blocks Qwen 8B but leaves deterministic and Qwen 4B behavior
+recovery failure blocks Qwen 8B and Qwen 4B but leaves deterministic behavior
 available.
 
 ## Removal

@@ -536,13 +536,13 @@ func (a *app) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ran, leaseErr := a.with8BPowerLease(r.Context(), policy.Model, func() error {
+	ran, leaseErr := a.withProtectedModelPowerLease(r.Context(), policy.Model, func() error {
 		a.handleSelectedModelChatStream(w, r, req, policy, history, preparedDiagnostic, hasPreparedDiagnostic)
 		return nil
 	})
 	if !ran {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"error":  powerLeaseUnavailableMessage(),
+			"error":  powerLeaseUnavailableMessage(policy.Model),
 			"policy": powerLeaseUnavailablePolicy(policy),
 		})
 		return

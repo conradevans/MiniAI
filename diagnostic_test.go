@@ -552,7 +552,7 @@ func TestCausalDiagnosticUsesCuratedToolFreePacket(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat/stream", nil)
 	policy := modelPolicy{Allowed: true, Model: primaryModel, Mode: "primary"}
-	ran, leaseErr := a.with8BPowerLease(req.Context(), policy.Model, func() error {
+	ran, leaseErr := a.withProtectedModelPowerLease(req.Context(), policy.Model, func() error {
 		if !a.handleCuratedDiagnosticStream(recorder, req, "Why is MyScheduler returning 500?", policy) {
 			t.Fatal("expected curated diagnostic path")
 		}
