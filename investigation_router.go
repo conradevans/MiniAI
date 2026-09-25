@@ -212,8 +212,7 @@ type SemanticRouteProfile struct {
 	Requirements []evidenceRequirementTemplate
 }
 
-// phase2SemanticRouteProfiles is declarative shadow metadata. It never executes
-// a capability and is not referenced by the production request path.
+// phase2SemanticRouteProfiles declaratively maps supported semantic routes to bounded evidence requirements.
 func phase2SemanticRouteProfiles() []SemanticRouteProfile {
 	return []SemanticRouteProfile{
 		{ID: RouteExactCurrentFact},
@@ -298,7 +297,14 @@ func buildShadowInvestigationRoute(question string, context ShadowRouterContext)
 	}
 	frame.Subjects, frame.Ambiguity = resolveShadowSubjects(normalized, context)
 	frame.Domains = addSubjectDomains(frame.Domains, frame.Subjects)
+	if frame.Goal == GoalImplementationLocation && !hasDomain(frame, DomainRepository) {
+		frame.Domains = append(frame.Domains, DomainRepository)
+		sort.Slice(frame.Domains, func(i, j int) bool { return frame.Domains[i] < frame.Domains[j] })
+	}
 	frame.Exactness = classifyQuestionExactness(frame.Goal)
+	if !isEvidenceSeekingGoal(frame.Goal) {
+		frame.Ambiguity = QuestionAmbiguity{}
+	}
 	if !frame.Ambiguity.Ambiguous && requiresResolvedApplication(frame) && !hasApplicationSubject(frame.Subjects) {
 		frame.Ambiguity = QuestionAmbiguity{Ambiguous: true, Reason: "unresolved_application_subject"}
 	}
@@ -337,9 +343,7 @@ func buildShadowInvestigationRoute(question string, context ShadowRouterContext)
 	}
 }
 
-// routePhase2BQuestion is the shadow-only seam used by the isolated Phase 2B
-// pipeline. Keeping routing here makes the existing production-path audit able
-// to distinguish route implementation from request-handler integration.
+// routePhase2BQuestion is the deterministic semantic routing seam shared by tests and production.
 func routePhase2BQuestion(question string, context ShadowRouterContext) ShadowRouteDecision {
 	return buildShadowInvestigationRoute(question, context)
 }
@@ -352,17 +356,52 @@ func classifyInvestigationGoal(question string) InvestigationGoal {
 		return GoalCausalAssessment
 	case containsAnyConcept(question, "compare", "versus", "difference between"):
 		return GoalComparison
-	case containsAnyConcept(question, "why", "what happened", "explain", "diagnose", "investigate"):
+	case containsAnyConcept(question, "why", "what happened", "diagnose", "investigate") ||
+		(containsConcept(question, "explain") && containsAnyConcept(question,
+			"outage", "failure", "failed", "failing", "error", "crash", "restart", "reboot",
+			"incident", "broken", "issue", "problem", "what changed")):
 		return GoalIncidentExplanation
-	case containsAnyConcept(question, "healthy", "health", "normal", "overheating", "too hot", "doing", "condition", "okay", "ok"):
+	case containsAnyConcept(question, "healthy", "health", "normal", "overheating", "too hot", "doing", "condition", "okay", "ok", "armed") ||
+		isCurrentPerformanceAssessment(question):
 		return GoalCurrentAssessment
-	case containsAnyConcept(question, "trend", "over time", "history", "historical"):
+	case containsAnyConcept(question, "trend", "over time", "history", "historical",
+		"last hour", "last 24 hours", "last day", "last week", "yesterday", "earlier", "during"):
 		return GoalTrend
 	case containsAnyConcept(question, "what commit", "which commit", "what sha", "which sha", "what branch", "which branch", "how many", "is active", "current status", "exact"):
 		return GoalExactFact
 	default:
 		return GoalUnresolved
 	}
+}
+
+func isCurrentPerformanceAssessment(question string) bool {
+	if !containsAnyConcept(question, "slow", "latency", "performance") {
+		return false
+	}
+	return containsAnyConcept(question, "now", "today", "current", "currently") ||
+		strings.HasPrefix(question, "is ") || strings.HasPrefix(question, "are ") ||
+		strings.HasPrefix(question, "has ") || strings.HasPrefix(question, "have ")
+}
+
+func isEvidenceSeekingGoal(goal InvestigationGoal) bool {
+	switch goal {
+	case GoalExactFact, GoalCurrentAssessment, GoalTrend, GoalIncidentExplanation,
+		GoalComparison, GoalCausalAssessment, GoalImplementationLocation:
+		return true
+	default:
+		return false
+	}
+}
+
+// isEvidenceSeekingQuestion is a pure semantic preclassification. It must not
+// perform evidence reads because production uses it to choose one architecture.
+func isEvidenceSeekingQuestion(question string) bool {
+	normalized := normalizeQuestionText(question)
+	if isEvidenceSeekingGoal(classifyInvestigationGoal(normalized)) {
+		return true
+	}
+	return containsAnyConcept(normalized, "check", "inspect", "show", "read", "list", "look up", "lookup") &&
+		len(classifyEvidenceDomains(normalized)) > 0
 }
 
 func classifyQuestionExactness(goal InvestigationGoal) QuestionExactness {
@@ -408,6 +447,7 @@ func classifyEvidenceDomains(question string) []EvidenceDomain {
 }
 
 func resolveShadowSubjects(question string, context ShadowRouterContext) ([]EvidenceSubject, QuestionAmbiguity) {
+	questionKey := normalizeMatch(question)
 	entities := append([]RouterEntity{{
 		Subject: EvidenceSubject{Kind: SubjectHost, ID: "dell", Name: "Dell"},
 		Aliases: []string{"dell", "host", "server"},
@@ -416,14 +456,17 @@ func resolveShadowSubjects(question string, context ShadowRouterContext) ([]Evid
 	for _, entity := range entities {
 		aliases := append([]string{entity.Subject.ID, entity.Subject.Name}, entity.Aliases...)
 		for _, alias := range aliases {
-			if alias == "" || !containsConcept(question, normalizeQuestionText(alias)) {
+			aliasKey := normalizeMatch(alias)
+			if alias == "" || (!containsConcept(question, normalizeQuestionText(alias)) &&
+				(aliasKey == "" || !strings.Contains(questionKey, aliasKey))) {
 				continue
 			}
 			key := string(entity.Subject.Kind) + ":" + entity.Subject.ID
 			byKey[key] = entity.Subject
 		}
 	}
-	if len(byKey) == 0 && containsAnyConcept(question, "it", "this app", "that app", "this deployment") {
+	if len(byKey) == 0 && (containsAnyConcept(question, "it", "this app", "that app", "this deployment") ||
+		shouldInheritBareThisApplication(question)) {
 		for _, subject := range context.ConversationSubjects {
 			byKey[string(subject.Kind)+":"+subject.ID] = subject
 		}
@@ -472,31 +515,53 @@ func addSubjectDomains(domains []EvidenceDomain, subjects []EvidenceSubject) []E
 }
 
 func selectSemanticRoute(frame QuestionFrame) InvestigationRouteID {
-	if frame.Ambiguity.Ambiguous || unsupportedReason(frame) != "" {
+	if frame.Ambiguity.Ambiguous || unsupportedReason(frame) != "" || !isEvidenceSeekingGoal(frame.Goal) {
 		return RouteUnresolved
 	}
 	switch {
-	case frame.Goal == GoalImplementationLocation || hasDomain(frame, DomainRepository):
+	case frame.Goal == GoalImplementationLocation && hasDomain(frame, DomainRepository):
 		return RouteRepositoryInvestigation
-	case frame.Goal == GoalExactFact:
+	case frame.Goal == GoalExactFact && len(frame.Domains) > 0:
 		return RouteExactCurrentFact
 	case frame.Goal == GoalCausalAssessment && hasDomain(frame, DomainDeployment):
 		return RouteDeploymentCorrelation
-	case hasDomain(frame, DomainRecovery):
+	case hasDomain(frame, DomainRecovery) &&
+		(frame.Goal == GoalIncidentExplanation || frame.Goal == GoalTrend || frame.Goal == GoalCurrentAssessment):
 		return RouteRestartInvestigation
-	case hasDomain(frame, DomainThermal):
+	case hasDomain(frame, DomainThermal) &&
+		(frame.Goal == GoalCurrentAssessment || frame.Goal == GoalTrend || frame.Goal == GoalIncidentExplanation):
 		return RouteThermalInvestigation
-	case hasDomain(frame, DomainDatabase):
+	case hasDomain(frame, DomainDatabase) &&
+		(frame.Goal == GoalCurrentAssessment || frame.Goal == GoalTrend || frame.Goal == GoalIncidentExplanation):
 		return RouteDatabaseInvestigation
-	case hasDomain(frame, DomainApplication) && hasDomain(frame, DomainPerformance):
+	case hasDomain(frame, DomainApplication) && hasDomain(frame, DomainPerformance) &&
+		(frame.Goal == GoalCurrentAssessment || frame.Goal == GoalTrend || frame.Goal == GoalIncidentExplanation):
 		return RouteApplicationPerformance
-	case hasDomain(frame, DomainApplication):
+	case hasDomain(frame, DomainApplication) &&
+		(frame.Goal == GoalCurrentAssessment || frame.Goal == GoalIncidentExplanation):
 		return RouteApplicationCurrent
 	case hasDomain(frame, DomainPlatform) && frame.Goal == GoalCurrentAssessment:
 		return RouteCurrentPlatformHealth
 	default:
 		return RouteUnresolved
 	}
+}
+
+func shouldInheritBareThisApplication(question string) bool {
+	if !containsConcept(question, "this") {
+		return false
+	}
+	goal := classifyInvestigationGoal(question)
+	if goal != GoalCausalAssessment && goal != GoalIncidentExplanation {
+		return false
+	}
+	domains := classifyEvidenceDomains(question)
+	for _, domain := range domains {
+		if domain == DomainDeployment || domain == DomainRecovery || domain == DomainInfrastructure || domain == DomainRuntime {
+			return true
+		}
+	}
+	return false
 }
 
 func unsupportedReason(frame QuestionFrame) string {
@@ -514,6 +579,9 @@ func unsupportedReason(frame QuestionFrame) string {
 }
 
 func requiresResolvedApplication(frame QuestionFrame) bool {
+	if !isEvidenceSeekingGoal(frame.Goal) {
+		return false
+	}
 	if frame.Goal == GoalImplementationLocation || hasDomain(frame, DomainRepository) {
 		return true
 	}

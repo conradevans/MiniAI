@@ -8,6 +8,7 @@ import (
 )
 
 type agentToolEvent struct {
+	RequestID string         `json:"request_id,omitempty"`
 	Phase     string         `json:"phase"`
 	Name      string         `json:"name"`
 	Arguments map[string]any `json:"arguments,omitempty"`

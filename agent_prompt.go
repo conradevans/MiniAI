@@ -7,6 +7,9 @@ import (
 )
 
 func shouldUseAgentTools(message string) bool {
+	if !isEvidenceSeekingQuestion(message) {
+		return false
+	}
 	m := strings.ToLower(message)
 	terms := []string{
 		"why", "error", "fail", "bug", "debug", "trace", "inspect", "investigate",

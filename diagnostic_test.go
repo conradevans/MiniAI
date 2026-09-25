@@ -178,33 +178,23 @@ func TestDeterministicDiagnosticPrecedesOllamaChecks(t *testing.T) {
 	}
 }
 
-func TestCleanVerificationPrecedesOllamaChecks(t *testing.T) {
-	logs := `172.20.0.1 - - [08/Sep/2026:19:43:55 +0000] "GET /health HTTP/1.1" 200 42 "-" "client/2.0" "-"`
-	a, cleanup := newDiagnosticTestApp(t, []any{healthyMySchedulerDeployment()}, nil, logs, "")
-	defer cleanup()
-	ollamaCalls := 0
-	ollama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ollamaCalls++
-		http.Error(w, "unexpected Ollama request", http.StatusInternalServerError)
-	}))
-	defer ollama.Close()
-	a.ollamaURL = ollama.URL
-	a.sessions = map[string]*session{
+func TestCleanVerificationUsesPhase2COnePassReasoner(t *testing.T) {
+	harness := newPhase2CTestHarness(t, 12)
+	harness.app.sessions = map[string]*session{
 		"verification-session": {
-			ID:            "verification-session",
-			CreatedAt:     time.Now(),
-			LastHeartbeat: time.Now(),
-			LastChat:      time.Now(),
+			ID: "verification-session", CreatedAt: time.Now(),
+			LastHeartbeat: time.Now(), LastChat: time.Now(),
 		},
 	}
 	recorder := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat/stream", strings.NewReader(
 		`{"session_id":"verification-session","message":"Is MyScheduler okay?"}`,
 	))
-	a.handleChatStream(recorder, req)
-	if ollamaCalls != 0 || !strings.Contains(recorder.Body.String(), `"model_invoked":false`) ||
-		!strings.Contains(recorder.Body.String(), `"diagnostic_confidence":"strongly_supported"`) {
-		t.Fatalf("ollama_calls=%d stream=%s", ollamaCalls, recorder.Body.String())
+	harness.app.handleChatStream(recorder, req)
+	if len(harness.requests()) != 1 || !strings.Contains(recorder.Body.String(), `"answer_mode":"phase2c"`) ||
+		!strings.Contains(recorder.Body.String(), `"reasoner_calls":1`) ||
+		!strings.Contains(recorder.Body.String(), `"planner_calls":0`) {
+		t.Fatalf("model_calls=%d stream=%s", len(harness.requests()), recorder.Body.String())
 	}
 }
 

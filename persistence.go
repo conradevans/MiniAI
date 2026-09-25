@@ -25,6 +25,7 @@ type sseCaptureWriter struct {
 }
 
 type pendingEvidence struct {
+	RequestID string
 	Name      string
 	Arguments map[string]any
 	Summary   string
@@ -97,6 +98,7 @@ func (w *sseCaptureWriter) consumeBlock(block string) {
 func (w *sseCaptureWriter) captureTool(obj map[string]any) {
 	phase, _ := obj["phase"].(string)
 	name, _ := obj["name"].(string)
+	requestID, _ := obj["request_id"].(string)
 	if name == "" {
 		return
 	}
@@ -104,15 +106,31 @@ func (w *sseCaptureWriter) captureTool(obj map[string]any) {
 	case "start":
 		args, _ := obj["arguments"].(map[string]any)
 		summary, _ := obj["summary"].(string)
-		w.pending = append(w.pending, pendingEvidence{Name: name, Arguments: args, Summary: summary})
+		w.pending = append(w.pending, pendingEvidence{RequestID: requestID, Name: name, Arguments: args, Summary: summary})
 	case "result":
 		summary, _ := obj["summary"].(string)
+		resultArgs, _ := obj["arguments"].(map[string]any)
 		for i := len(w.pending) - 1; i >= 0; i-- {
 			pending := &w.pending[i]
-			if pending.Completed || pending.Name != name {
+			if pending.Completed {
+				continue
+			}
+			if requestID != "" {
+				if pending.RequestID != requestID {
+					continue
+				}
+			} else if pending.Name != name {
 				continue
 			}
 			pending.Completed = true
+			if len(resultArgs) > 0 {
+				if pending.Arguments == nil {
+					pending.Arguments = map[string]any{}
+				}
+				for key, value := range resultArgs {
+					pending.Arguments[key] = value
+				}
+			}
 			if summary == "" {
 				summary = pending.Summary
 			}

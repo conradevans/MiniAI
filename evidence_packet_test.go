@@ -4,9 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"go/ast"
-	"go/parser"
-	"go/token"
 	"os"
 	"strings"
 	"testing"
@@ -131,76 +128,18 @@ func TestEvidencePacketIsByteStableAcrossInputPermutation(t *testing.T) {
 	}
 }
 
-func TestPhase2BPipelineHasNoProductionCallSites(t *testing.T) {
-	implementationFiles := map[string]bool{
-		"investigation_router.go": true,
-		"evidence_plan.go":        true,
-		"evidence_executor.go":    true,
-		"evidence_reducers.go":    true,
-		"confidence.go":           true,
-		"evidence_packet.go":      true,
-		"evidence_pipeline.go":    true,
-	}
-	phase2BNames := map[string]bool{
-		"buildShadowInvestigationRoute": true,
-		"routePhase2BQuestion":          true,
-		"requirementsForRoute":          true,
-		"phase2SemanticRouteProfiles":   true,
-	}
-	for path := range implementationFiles {
-		if path == "investigation_router.go" {
-			continue
-		}
-		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.SkipObjectResolution)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, declaration := range file.Decls {
-			switch declaration := declaration.(type) {
-			case *ast.FuncDecl:
-				if declaration.Recv == nil {
-					phase2BNames[declaration.Name.Name] = true
-				}
-			case *ast.GenDecl:
-				for _, specification := range declaration.Specs {
-					switch specification := specification.(type) {
-					case *ast.TypeSpec:
-						phase2BNames[specification.Name.Name] = true
-					case *ast.ValueSpec:
-						for _, name := range specification.Names {
-							phase2BNames[name.Name] = true
-						}
-					}
-				}
-			}
-		}
-	}
-
-	entries, err := os.ReadDir(".")
+func TestPhase2BPipelineHasProductionPhase2CCallSite(t *testing.T) {
+	data, err := os.ReadFile("phase2c_stream.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	checked := 0
-	for _, entry := range entries {
-		path := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") || implementationFiles[path] {
-			continue
+	production := string(data)
+	for _, identifier := range []string{
+		"NewPhase2BPipeline", "Prepare", "ExecutePrepared", "callOnePassReasonerWithKeepalive",
+	} {
+		if !strings.Contains(production, identifier) {
+			t.Fatalf("Phase 2C production coordinator does not reference %s", identifier)
 		}
-		checked++
-		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.SkipObjectResolution)
-		if err != nil {
-			t.Fatal(err)
-		}
-		ast.Inspect(file, func(node ast.Node) bool {
-			identifier, ok := node.(*ast.Ident)
-			if ok && phase2BNames[identifier.Name] {
-				t.Errorf("production root file %s references Phase 2B identifier %s", path, identifier.Name)
-			}
-			return true
-		})
-	}
-	if checked == 0 {
-		t.Fatal("production isolation guard checked no root Go files")
 	}
 }
 

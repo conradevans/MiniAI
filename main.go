@@ -44,6 +44,11 @@ type app struct {
 	eightBProfile     ollamaInferenceProfile
 	powerLeaseManager *cpuPowerLeaseManager
 
+	phase2Executor     capabilityExecutor
+	phase2Now          func() time.Time
+	systemStatusReader func() (systemStatus, error)
+	ollamaStatusReader func(context.Context) ollamaStatus
+
 	mu       sync.Mutex
 	sessions map[string]*session
 
@@ -496,10 +501,31 @@ func (a *app) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
-	if a.handleConversationRepositoryLookup(w, r, req.Message, history) {
+	if isSimpleRepositoryLocationQuestion(req.Message) {
+		if a.handleConversationRepositoryLookup(w, r, req.Message, history) {
+			return
+		}
+		emitDeterministicDiagnosticAnswer(
+			w,
+			"I couldn't resolve that exact repository location from the available evidence.",
+			nil,
+			map[string]any{"evidence_sources": 0, "lookup": "repository"},
+		)
 		return
 	}
-	if a.handleConversationDiagnosticLookup(w, r, req.Message, history) {
+	if isExactDeterministicDiagnosticIntent(req.Message) {
+		if a.handleConversationDiagnosticLookup(w, r, req.Message, history) {
+			return
+		}
+		emitDeterministicDiagnosticAnswer(
+			w,
+			"I couldn't resolve that exact fact from the available evidence.",
+			nil,
+			map[string]any{"evidence_sources": 0, "lookup": "diagnostic"},
+		)
+		return
+	}
+	if isEvidenceSeekingQuestion(req.Message) && a.handlePhase2CStream(w, r, req.Message, history) {
 		return
 	}
 
@@ -517,12 +543,12 @@ func (a *app) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sys, err := readSystemStatus()
+	sys, err := a.phase2CSystemStatus()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	oll := a.getOllamaStatus(r.Context())
+	oll := a.phase2COllamaStatus(r.Context())
 	if !oll.Reachable {
 		writeError(w, http.StatusServiceUnavailable, "ollama is unavailable")
 		return

@@ -162,6 +162,10 @@ func (a *app) resolveDiagnosticSnapshot(ctx context.Context, message string) (ap
 	if err != nil {
 		return appDiagnosticSnapshot{}, false
 	}
+	return a.resolveDiagnosticSnapshotFromDeployments(ctx, message, deployments)
+}
+
+func (a *app) resolveDiagnosticSnapshotFromDeployments(ctx context.Context, message string, deployments []map[string]any) (appDiagnosticSnapshot, bool) {
 	system, systemErr := a.fetchReactorSystem(ctx)
 	normalized := normalizeMatch(message)
 	type candidate struct {
@@ -436,14 +440,19 @@ func (a *app) handleConversationDiagnosticLookup(w http.ResponseWriter, r *http.
 		return false
 	}
 
-	subject := a.resolveConversationSubject(r.Context(), message, history)
-	if subject.App == "" || subject.Ambiguous {
-		return a.handleDeterministicDiagnosticLookup(w, r, message)
+	deployments, err := a.fetchDeployments(r.Context())
+	if err != nil {
+		return false
 	}
-
-	// Passing only the canonical app name selects identity. The snapshot
-	// resolver still fetches current ReactorLab state for this request.
-	snapshot, ok := a.resolveDiagnosticSnapshot(r.Context(), subject.App)
+	subject := resolveConversationSubjectFromDeployments(message, history, deployments)
+	if subject.Ambiguous {
+		return false
+	}
+	lookup := message
+	if subject.App != "" {
+		lookup = subject.App
+	}
+	snapshot, ok := a.resolveDiagnosticSnapshotFromDeployments(r.Context(), lookup, deployments)
 	if !ok {
 		return false
 	}
