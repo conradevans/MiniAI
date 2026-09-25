@@ -24,6 +24,7 @@ type capabilityHandler func(context.Context, *app, map[string]any) (any, string,
 type capability struct {
 	Kind       capabilityKind
 	Undo       undoMode
+	Metadata   CapabilityMetadata
 	Definition toolDefinition
 	handler    capabilityHandler
 }
@@ -51,6 +52,7 @@ func phase0CapabilityRegistry() capabilityRegistry {
 		return capability{
 			Kind:       capabilityKindRead,
 			Undo:       undoModeNone,
+			Metadata:   phase2CapabilityMetadata(definition.Function.Name),
 			Definition: definition,
 			handler:    handler,
 		}

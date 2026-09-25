@@ -173,3 +173,115 @@ func TestCapabilityExecutorRejectsUnknownTool(t *testing.T) {
 		t.Fatalf("result=%v summary=%q want nil/empty", result, summary)
 	}
 }
+
+func TestPhase2ACapabilityMetadataCompleteDeterministicReadOnly(t *testing.T) {
+	metadata := func(
+		families []CapabilityFamily,
+		evidenceTypes []EvidenceType,
+		concurrencyKey string,
+		costUnits int,
+		maxFanout int,
+	) CapabilityMetadata {
+		return CapabilityMetadata{
+			Families: families, EvidenceTypes: evidenceTypes,
+			ConcurrentSafe: true, ConcurrencyKey: concurrencyKey,
+			CostUnits: costUnits, MaxFanout: maxFanout,
+		}
+	}
+	want := map[string]CapabilityMetadata{
+		"get_platform_overview": metadata(
+			[]CapabilityFamily{CapabilityFamilyPlatformCurrent},
+			[]EvidenceType{EvidenceTypeCurrentPlatformState}, "reactorlab", 1, 1,
+		),
+		"list_apps": metadata(
+			[]CapabilityFamily{CapabilityFamilyDeploymentCurrent},
+			[]EvidenceType{EvidenceTypeCurrentDeploymentList, EvidenceTypeCurrentDeployment, EvidenceTypeCurrentApplication}, "minideploy", 1, 1,
+		),
+		"get_app_context": metadata(
+			[]CapabilityFamily{CapabilityFamilyDeploymentCurrent, CapabilityFamilyDatabaseState, CapabilityFamilyPlatformCurrent},
+			[]EvidenceType{EvidenceTypeCurrentApplication, EvidenceTypeCurrentDeployment, EvidenceTypeCurrentDatabase, EvidenceTypeCurrentPlatformState}, "app_context", 7, 7,
+		),
+		"read_host_history": metadata(
+			[]CapabilityFamily{CapabilityFamilyHostHistory},
+			[]EvidenceType{EvidenceTypeHostHistory}, "reactorlab", 1, 1,
+		),
+		"read_temperature_history": metadata(
+			[]CapabilityFamily{CapabilityFamilyHostHistory},
+			[]EvidenceType{EvidenceTypeThermalHistory}, "reactorlab", 1, 1,
+		),
+		"read_application_history": metadata(
+			[]CapabilityFamily{CapabilityFamilyApplicationHistory},
+			[]EvidenceType{EvidenceTypeApplicationHistory}, "reactorlab", 2, 2,
+		),
+		"read_service_history": metadata(
+			[]CapabilityFamily{CapabilityFamilyApplicationHistory},
+			[]EvidenceType{EvidenceTypeServiceHistory}, "reactorlab", 1, 1,
+		),
+		"read_infrastructure_events": metadata(
+			[]CapabilityFamily{CapabilityFamilyInfrastructureTimeline},
+			[]EvidenceType{EvidenceTypeInfrastructureEvents}, "reactorlab", 1, 1,
+		),
+		"list_databases": metadata(
+			[]CapabilityFamily{CapabilityFamilyDatabaseState},
+			[]EvidenceType{EvidenceTypeCurrentDatabase}, "reactorlab", 1, 1,
+		),
+		"read_database_backups": metadata(
+			[]CapabilityFamily{CapabilityFamilyDatabaseState},
+			[]EvidenceType{EvidenceTypeDatabaseBackups}, "reactorlab", 1, 1,
+		),
+		"read_activity": metadata(
+			[]CapabilityFamily{CapabilityFamilyInfrastructureTimeline},
+			[]EvidenceType{EvidenceTypeActivityTimeline}, "reactorlab", 1, 1,
+		),
+		"read_recovery": metadata(
+			[]CapabilityFamily{CapabilityFamilyInfrastructureTimeline},
+			[]EvidenceType{EvidenceTypeRecoveryTimeline}, "reactorlab", 1, 1,
+		),
+		"list_repository_directory": metadata(
+			[]CapabilityFamily{CapabilityFamilySourceRepository},
+			[]EvidenceType{EvidenceTypeRepositoryInventory}, "repository", 1, 1,
+		),
+		"search_repository": metadata(
+			[]CapabilityFamily{CapabilityFamilySourceRepository},
+			[]EvidenceType{EvidenceTypeRepositorySearch}, "repository", 1, 1,
+		),
+		"read_repository_file": metadata(
+			[]CapabilityFamily{CapabilityFamilySourceRepository},
+			[]EvidenceType{EvidenceTypeRepositoryContent}, "repository", 1, 1,
+		),
+		"read_runtime_logs": metadata(
+			[]CapabilityFamily{CapabilityFamilyRuntimeEvidence},
+			[]EvidenceType{EvidenceTypeRuntimeFailures}, "minideploy", 1, 1,
+		),
+		"read_deployment_logs": metadata(
+			[]CapabilityFamily{CapabilityFamilyDeploymentHistory, CapabilityFamilyRuntimeEvidence},
+			[]EvidenceType{EvidenceTypeDeploymentFailures}, "minideploy", 1, 1,
+		),
+		"read_deployment_history": metadata(
+			[]CapabilityFamily{CapabilityFamilyDeploymentHistory},
+			[]EvidenceType{EvidenceTypeDeploymentTimeline}, "reactorlab", 1, 1,
+		),
+	}
+	first := phase0CapabilityRegistry()
+	second := phase0CapabilityRegistry()
+	if len(first.capabilities) != len(second.capabilities) || len(first.capabilities) != len(want) {
+		t.Fatalf("registry/metadata lengths=%d/%d/%d", len(first.capabilities), len(second.capabilities), len(want))
+	}
+	for index, item := range first.capabilities {
+		other := second.capabilities[index]
+		if !reflect.DeepEqual(item.Metadata, other.Metadata) {
+			t.Fatalf("capability %q metadata is not deterministic: %+v / %+v", item.Definition.Function.Name, item.Metadata, other.Metadata)
+		}
+		if item.Kind != capabilityKindRead || item.Undo != undoModeNone {
+			t.Fatalf("capability %q is not read-only: kind=%q undo=%q", item.Definition.Function.Name, item.Kind, item.Undo)
+		}
+		name := item.Definition.Function.Name
+		expected, ok := want[name]
+		if !ok {
+			t.Fatalf("capability %q has no expected metadata", name)
+		}
+		if !reflect.DeepEqual(item.Metadata, expected) {
+			t.Fatalf("capability %q metadata=%+v want %+v", name, item.Metadata, expected)
+		}
+	}
+}
