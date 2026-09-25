@@ -238,7 +238,10 @@ func phase2SemanticRouteProfiles() []SemanticRouteProfile {
 		{ID: RouteApplicationPerformance, Requirements: []evidenceRequirementTemplate{
 			{EvidenceTypeCurrentApplication, requirementApplication, windowCurrent, CriticalityCritical, CardinalityOne},
 			{EvidenceTypeApplicationHistory, requirementApplication, windowQuestion24h, CriticalityCritical, CardinalityMany},
-			{EvidenceTypeServiceHistory, requirementApplication, windowQuestion24h, CriticalityRelevant, CardinalityMany},
+			// ReactorLab service history is platform-service evidence, not an
+			// application-scoped series. Keep the subject honest until an API can
+			// resolve deployed application services to observability service IDs.
+			{EvidenceTypeServiceHistory, requirementHost, windowQuestion24h, CriticalityRelevant, CardinalityMany},
 			{EvidenceTypeHostHistory, requirementHost, windowQuestion24h, CriticalitySupporting, CardinalityMany},
 		}},
 		{ID: RouteDeploymentCorrelation, Requirements: []evidenceRequirementTemplate{
@@ -332,6 +335,13 @@ func buildShadowInvestigationRoute(question string, context ShadowRouterContext)
 		Frame:        frame,
 		Requirements: requirements,
 	}
+}
+
+// routePhase2BQuestion is the shadow-only seam used by the isolated Phase 2B
+// pipeline. Keeping routing here makes the existing production-path audit able
+// to distinguish route implementation from request-handler integration.
+func routePhase2BQuestion(question string, context ShadowRouterContext) ShadowRouteDecision {
+	return buildShadowInvestigationRoute(question, context)
 }
 
 func classifyInvestigationGoal(question string) InvestigationGoal {
