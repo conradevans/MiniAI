@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -422,6 +424,48 @@ func TestPhase2CInvalidReasonerOutputDoesNotRetryOrLeak(t *testing.T) {
 	stream := rr.Body.String()
 	if len(h.requests()) != 1 || capture.answer.String() != safeReasonerLimitation() || strings.Contains(stream, "private scratch") || !strings.Contains(stream, `"answer_validation":"invalid"`) {
 		t.Fatalf("calls=%d answer=%q stream=%s", len(h.requests()), capture.answer.String(), stream)
+	}
+}
+
+func TestPhase2CValidationFailureLogsSafeReasonWithoutRawModelContent(t *testing.T) {
+	h := newPhase2CTestHarness(t, 12)
+	const privateModelContent = "DO_NOT_LOG_RAW_MODEL_CONTENT"
+	h.responseBuilder = func(request chatAPIRequest) string {
+		return phase2CTestDraftForRequest(request, "The Dell is healthy.", []string{privateModelContent})
+	}
+
+	var logs bytes.Buffer
+	previousWriter := log.Writer()
+	previousFlags := log.Flags()
+	previousPrefix := log.Prefix()
+	log.SetOutput(&logs)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	t.Cleanup(func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+		log.SetPrefix(previousPrefix)
+	})
+
+	rr := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/chat/stream", nil)
+	if !h.app.handlePhase2CStream(rr, r, "Is the Dell healthy right now?", nil) {
+		t.Fatal("Phase 2C request was not handled")
+	}
+	logged := logs.String()
+	if !strings.Contains(logged, "Phase 2C reasoner validation rejected: invalid evidence reference") {
+		t.Fatalf("safe validation reason was not logged: %q", logged)
+	}
+	if strings.Contains(logged, privateModelContent) {
+		t.Fatalf("validation log leaked raw model content: %q", logged)
+	}
+	if got := len(h.reasonerRequests()); got != 1 {
+		t.Fatalf("invalid output triggered %d reasoner requests", got)
+	}
+	if phase2CStreamAnswer(t, rr.Body.String()) != safeReasonerLimitation() ||
+		!strings.Contains(rr.Body.String(), `"answer_validation":"invalid"`) ||
+		!strings.Contains(rr.Body.String(), `"confidence":"Low"`) {
+		t.Fatalf("invalid output did not use the safe Low-confidence fallback: %s", rr.Body.String())
 	}
 }
 

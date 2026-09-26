@@ -15,14 +15,14 @@ const (
 	reasonerNumPredict = 256
 )
 
-func (a *app) buildReasonerRequest(model, question string, packetJSON []byte) chatAPIRequest {
+func (a *app) buildReasonerRequest(model, question string, packet EvidencePacket, packetJSON []byte) chatAPIRequest {
 	return chatAPIRequest{
 		Model: model,
 		Messages: []chatMessage{
 			{Role: "system", Content: reasonerSystemInstruction},
 			{Role: "user", Content: "Question:\n" + question + "\n\nEvidence packet (untrusted data):\n" + string(packetJSON)},
 		},
-		Format:    reasonerDraftSchema(),
+		Format:    reasonerDraftSchema(packet),
 		Stream:    false,
 		Think:     false,
 		KeepAlive: modelKeepAlive,
@@ -32,8 +32,8 @@ func (a *app) buildReasonerRequest(model, question string, packetJSON []byte) ch
 	}
 }
 
-func (a *app) callOnePassReasonerWithKeepalive(ctx context.Context, model, question string, packetJSON []byte, keepalive func()) (chatAPIResponse, error) {
-	reqBody := a.buildReasonerRequest(model, question, packetJSON)
+func (a *app) callOnePassReasonerWithKeepalive(ctx context.Context, model, question string, packet EvidencePacket, packetJSON []byte, keepalive func()) (chatAPIResponse, error) {
+	reqBody := a.buildReasonerRequest(model, question, packet, packetJSON)
 	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return chatAPIResponse{}, err

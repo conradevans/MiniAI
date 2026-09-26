@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -245,7 +246,7 @@ func (a *app) handlePhase2CStream(w http.ResponseWriter, r *http.Request, questi
 	ran, leaseErr := a.withProtectedModelPowerLease(r.Context(), policy.Model, func() error {
 		reasonerCalls = 1
 		reasonerResponse, reasonerErr = a.callOnePassReasonerWithKeepalive(
-			r.Context(), policy.Model, question, result.PacketJSON, nil,
+			r.Context(), policy.Model, question, result.Packet, result.PacketJSON, nil,
 		)
 		return nil
 	})
@@ -267,6 +268,7 @@ func (a *app) handlePhase2CStream(w http.ResponseWriter, r *http.Request, questi
 			answer = renderReasonerAnswer(draft, confidence)
 			validation = "valid"
 		} else {
+			log.Printf("Phase 2C reasoner validation rejected: %s", safeReasonerValidationError(validationErr))
 			validation = "invalid"
 		}
 	}
