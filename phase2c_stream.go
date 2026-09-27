@@ -26,7 +26,11 @@ func (a *app) phase2CPipeline() Phase2BPipeline {
 	if now == nil {
 		now = time.Now
 	}
-	return NewPhase2BPipeline(phase0CapabilityRegistry(), executor, now)
+	pipeline := NewPhase2BPipeline(phase0CapabilityRegistry(), executor, now)
+	if a.phase2Reducer != nil {
+		pipeline.reduce = a.phase2Reducer
+	}
+	return pipeline
 }
 
 func (a *app) buildProductionRouterContext(ctx context.Context, question string, history []storedMessage, now time.Time) ShadowRouterContext {
@@ -191,8 +195,15 @@ func (a *app) handlePhase2CStream(w http.ResponseWriter, r *http.Request, questi
 		}
 		return false
 	}
+	if !isRecognizedLocalEvidenceIntent(question, prepared.Route) {
+		return false
+	}
 	if isRecognizedPhase2CAmbiguity(prepared.Route) {
 		emitPhase2CClarification(w, prepared.Route, phase2CClarification(prepared.Route))
+		return true
+	}
+	if prepared.Route.Resolution == RouteResolutionUnsupported {
+		emitUnsupportedLocalEvidence(w)
 		return true
 	}
 	if prepared.Route.Resolution != RouteResolutionSupported || !isPhase2CReasonedRoute(prepared.Route.ID) {
@@ -201,26 +212,13 @@ func (a *app) handlePhase2CStream(w http.ResponseWriter, r *http.Request, questi
 
 	result, err := pipeline.ExecutePrepared(r.Context(), prepared)
 	if err != nil {
+		if r.Context().Err() != nil {
+			return true
+		}
 		a.emitPhase2CLimitation(w, prepared, nil, nil, started, "evidence_pipeline_failed")
 		return true
 	}
-
-	sys, err := a.phase2CSystemStatus()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return true
-	}
-	ollama := a.phase2COllamaStatus(r.Context())
-	if !ollama.Reachable {
-		writeError(w, http.StatusServiceUnavailable, "ollama is unavailable")
-		return true
-	}
-	policy := choosePolicy(sys, ollama.LoadedModels)
-	if !policy.Allowed {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"error":  "MiniAI will not load a model while the Dell is under resource pressure",
-			"policy": policy,
-		})
+	if r.Context().Err() != nil {
 		return true
 	}
 
@@ -230,20 +228,64 @@ func (a *app) handlePhase2CStream(w http.ResponseWriter, r *http.Request, questi
 		return true
 	}
 	setSSEHeaders(w)
-	sendSSE(w, "meta", a.withInferenceProfileMetadata(policy.Model, map[string]any{
+	evidenceMeta := map[string]any{
 		"answer_mode": "phase2c", "route": prepared.Route.ID,
-		"model": policy.Model, "mode": policy.Mode, "agent": true,
+		"agent": true, "model_invoked": false,
+		"planner_calls": 0, "reasoner_calls": 0,
+		"tool_calls":            result.Plan.LogicalReads,
+		"evidence_packet_bytes": len(result.PacketJSON),
+		"evidence_rounds":       result.EvidenceRounds,
+		"second_round_reads":    result.SecondRoundReads,
+	}
+	if result.EvidenceProcessingLimitation != "" {
+		evidenceMeta["limitation"] = result.EvidenceProcessingLimitation
+	}
+	sendSSE(w, "meta", evidenceMeta)
+	emitPhase2CToolEvents(w, flusher, result.Plan, result.Results)
+	flusher.Flush()
+
+	if result.EvidenceProcessingLimitation != "" {
+		emitPhase2CPostEvidenceLimitation(w, flusher, result, started, result.EvidenceProcessingLimitation)
+		return true
+	}
+	if r.Context().Err() != nil {
+		return true
+	}
+
+	sys, err := a.phase2CSystemStatus()
+	if err != nil {
+		emitPhase2CPostEvidenceLimitation(w, flusher, result, started, "model_policy_unavailable")
+		return true
+	}
+	ollama := a.phase2COllamaStatus(r.Context())
+	if !ollama.Reachable {
+		emitPhase2CPostEvidenceLimitation(w, flusher, result, started, "ollama_unavailable")
+		return true
+	}
+	policy := choosePolicy(sys, ollama.LoadedModels)
+	if !policy.Allowed {
+		emitPhase2CPostEvidenceLimitation(w, flusher, result, started, "model_policy_blocked")
+		return true
+	}
+
+	sendSSE(w, "meta", a.withInferenceProfileMetadata(policy.Model, map[string]any{
+		"answer_mode": "phase2c", "route": prepared.Route.ID, "phase": "inference",
+		"model": policy.Model, "mode": policy.Mode, "agent": true, "model_invoked": true,
 		"planner_calls": 0, "reasoner_calls": 1,
 		"tool_calls":            result.Plan.LogicalReads,
 		"evidence_packet_bytes": len(result.PacketJSON),
+		"evidence_rounds":       result.EvidenceRounds,
+		"second_round_reads":    result.SecondRoundReads,
 	}))
-	emitPhase2CToolEvents(w, flusher, result.Plan, result.Results)
 	flusher.Flush()
 
 	var reasonerResponse chatAPIResponse
 	var reasonerErr error
 	reasonerCalls := 0
 	ran, leaseErr := a.withProtectedModelPowerLease(r.Context(), policy.Model, func() error {
+		if err := r.Context().Err(); err != nil {
+			return nil
+		}
 		reasonerCalls = 1
 		reasonerResponse, reasonerErr = a.callOnePassReasonerWithKeepalive(
 			r.Context(), policy.Model, question, result.Packet, result.PacketJSON, nil,
@@ -273,8 +315,43 @@ func (a *app) handlePhase2CStream(w http.ResponseWriter, r *http.Request, questi
 		}
 	}
 	emitBufferedAnswer(w, flusher, answer)
-	emitPhase2CDone(w, flusher, policy, prepared.Route.ID, result.Plan.LogicalReads, len(result.PacketJSON), reasonerCalls, reasonerResponse, started, validation, confidence)
+	emitPhase2CDone(
+		w, flusher, policy, prepared.Route.ID, result.Plan.LogicalReads, result.EvidenceRounds,
+		result.SecondRoundReads, len(result.PacketJSON), reasonerCalls, reasonerResponse, started, validation, confidence,
+	)
 	return true
+}
+
+func isRecognizedLocalEvidenceIntent(question string, decision ShadowRouteDecision) bool {
+	if !isEvidenceSeekingGoal(decision.Frame.Goal) {
+		return false
+	}
+	if len(decision.Frame.Subjects) > 0 {
+		return true
+	}
+	normalized := normalizeQuestionText(question)
+	if containsAnyConcept(normalized, "reactorlab", "dell") {
+		return true
+	}
+	if decision.Frame.Goal == GoalComparison {
+		return false
+	}
+	if decision.Frame.Ambiguity.Ambiguous && hasDomain(decision.Frame, DomainApplication) {
+		return true
+	}
+	if hasDomain(decision.Frame, DomainDatabase) && containsAnyConcept(normalized, "database", "databases", "backup", "backups") {
+		return true
+	}
+	if hasDomain(decision.Frame, DomainDeployment) && containsAnyConcept(normalized, "deploy", "deployed", "deployment", "release", "rollout") {
+		return true
+	}
+	if hasDomain(decision.Frame, DomainRepository) && containsAnyConcept(normalized, "repository", "repo", "source code", "implementation", "which file", "which function") {
+		return true
+	}
+	return containsAnyConcept(normalized,
+		"host", "platform", "server", "thermal", "temperature", "overheating", "restart", "restarted",
+		"reboot", "rebooted", "recovery", "watchdog", "outage", "app", "application", "service",
+		"runtime", "log", "logs", "infrastructure", "activity")
 }
 
 func (a *app) phase2CSystemStatus() (systemStatus, error) {
@@ -327,7 +404,7 @@ func phase2CResultSummary(result EvidenceResult) string {
 	return "evidence read completed"
 }
 
-func emitPhase2CDone(w http.ResponseWriter, flusher http.Flusher, policy modelPolicy, route InvestigationRouteID, toolCalls, packetBytes, reasonerCalls int, response chatAPIResponse, started time.Time, validation string, confidence ConfidenceLevel) {
+func emitPhase2CDone(w http.ResponseWriter, flusher http.Flusher, policy modelPolicy, route InvestigationRouteID, toolCalls, evidenceRounds, secondRoundReads, packetBytes, reasonerCalls int, response chatAPIResponse, started time.Time, validation string, confidence ConfidenceLevel) {
 	tokensPerSecond := 0.0
 	if response.EvalDuration > 0 {
 		tokensPerSecond = float64(response.EvalCount) / (float64(response.EvalDuration) / 1e9)
@@ -336,6 +413,7 @@ func emitPhase2CDone(w http.ResponseWriter, flusher http.Flusher, policy modelPo
 		"answer_mode": "phase2c", "route": route,
 		"model": policy.Model, "mode": policy.Mode, "agent": true, "model_invoked": reasonerCalls == 1,
 		"planner_calls": 0, "reasoner_calls": reasonerCalls, "tool_calls": toolCalls,
+		"evidence_rounds": evidenceRounds, "second_round_reads": secondRoundReads,
 		"evidence_packet_bytes": packetBytes, "answer_validation": validation,
 		"confidence":            confidence,
 		"prompt_tokens":         response.PromptEvalCount,
@@ -349,6 +427,22 @@ func emitPhase2CDone(w http.ResponseWriter, flusher http.Flusher, policy modelPo
 	flusher.Flush()
 }
 
+func emitPhase2CPostEvidenceLimitation(w http.ResponseWriter, flusher http.Flusher, result Phase2BResult, started time.Time, reason string) {
+	sendSSE(w, "meta", map[string]any{
+		"answer_mode": "phase2c", "route": result.Route.ID, "agent": true,
+		"model_invoked": false, "planner_calls": 0, "reasoner_calls": 0,
+		"tool_calls": result.Plan.LogicalReads, "evidence_rounds": result.EvidenceRounds,
+		"second_round_reads": result.SecondRoundReads, "evidence_packet_bytes": len(result.PacketJSON),
+		"limitation": reason,
+	})
+	flusher.Flush()
+	emitBufferedAnswer(w, flusher, safeReasonerLimitation())
+	emitPhase2CDone(
+		w, flusher, modelPolicy{}, result.Route.ID, result.Plan.LogicalReads, result.EvidenceRounds,
+		result.SecondRoundReads, len(result.PacketJSON), 0, chatAPIResponse{}, started, reason, ConfidenceLow,
+	)
+}
+
 func (a *app) emitPhase2CLimitation(w http.ResponseWriter, prepared Phase2BPrepared, results []EvidenceResult, packet []byte, started time.Time, reason string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -359,6 +453,7 @@ func (a *app) emitPhase2CLimitation(w http.ResponseWriter, prepared Phase2BPrepa
 	sendSSE(w, "meta", map[string]any{
 		"answer_mode": "phase2c", "route": prepared.Route.ID, "agent": true,
 		"planner_calls": 0, "reasoner_calls": 0, "tool_calls": prepared.Plan.LogicalReads,
+		"evidence_rounds": 1, "second_round_reads": 0,
 		"evidence_packet_bytes": len(packet), "limitation": reason,
 	})
 	if len(prepared.Plan.Requests) > 0 {
@@ -368,7 +463,7 @@ func (a *app) emitPhase2CLimitation(w http.ResponseWriter, prepared Phase2BPrepa
 		emitPhase2CToolEvents(w, flusher, prepared.Plan, results)
 	}
 	emitBufferedAnswer(w, flusher, safeReasonerLimitation())
-	emitPhase2CDone(w, flusher, modelPolicy{}, prepared.Route.ID, prepared.Plan.LogicalReads, len(packet), 0, chatAPIResponse{}, started, reason, ConfidenceLow)
+	emitPhase2CDone(w, flusher, modelPolicy{}, prepared.Route.ID, prepared.Plan.LogicalReads, 1, 0, len(packet), 0, chatAPIResponse{}, started, reason, ConfidenceLow)
 }
 
 func phase2CUnavailableResults(plan EvidencePlan) []EvidenceResult {
@@ -399,5 +494,23 @@ func emitPhase2CClarification(w http.ResponseWriter, decision ShadowRouteDecisio
 		"answer_mode": "deterministic", "route": decision.ID,
 		"model_invoked": false, "planner_calls": 0, "reasoner_calls": 0, "tool_calls": 0, "tokens": 0,
 	})
+	flusher.Flush()
+}
+
+func emitUnsupportedLocalEvidence(w http.ResponseWriter) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "streaming unsupported")
+		return
+	}
+	setSSEHeaders(w)
+	metadata := map[string]any{
+		"answer_mode": "deterministic", "limitation": "unsupported_local_evidence",
+		"model_invoked": false, "planner_calls": 0, "reasoner_calls": 0, "tool_calls": 0,
+		"evidence_rounds": 0, "second_round_reads": 0,
+	}
+	sendSSE(w, "meta", metadata)
+	emitBufferedAnswer(w, flusher, "I couldn't safely gather the specific ReactorLab evidence needed for that request. Confidence: Low.")
+	sendSSE(w, "done", metadata)
 	flusher.Flush()
 }

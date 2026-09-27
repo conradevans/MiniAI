@@ -7,12 +7,16 @@ import (
 )
 
 type Phase2BResult struct {
-	Route      ShadowRouteDecision   `json:"route"`
-	Plan       EvidencePlan          `json:"plan"`
-	Results    []EvidenceResult      `json:"results"`
-	Evidence   InvestigationEvidence `json:"evidence"`
-	Packet     EvidencePacket        `json:"packet"`
-	PacketJSON []byte                `json:"packetJson"`
+	Route                        ShadowRouteDecision   `json:"route"`
+	Plan                         EvidencePlan          `json:"plan"`
+	Results                      []EvidenceResult      `json:"results"`
+	Evidence                     InvestigationEvidence `json:"evidence"`
+	Packet                       EvidencePacket        `json:"packet"`
+	PacketJSON                   []byte                `json:"packetJson"`
+	EvidenceRounds               int                   `json:"evidenceRounds"`
+	SecondRoundReads             int                   `json:"secondRoundReads"`
+	EvidenceProcessingLimitation string                `json:"evidenceProcessingLimitation,omitempty"`
+	SecondRound                  SecondRoundDecision   `json:"-"`
 }
 
 // Phase2BPrepared captures one deterministic routing/planning instant. It lets
@@ -30,13 +34,26 @@ type Phase2BPipeline struct {
 	registry capabilityRegistry
 	executor capabilityExecutor
 	now      func() time.Time
+	reduce   evidenceReductionFunc
 }
+
+type evidenceReductionFunc func(
+	InvestigationRoute, string, []EvidenceRequirement, EvidencePlan, []EvidenceResult, capabilityRegistry,
+) (InvestigationEvidence, error)
 
 func NewPhase2BPipeline(registry capabilityRegistry, executor capabilityExecutor, now func() time.Time) Phase2BPipeline {
 	if now == nil {
 		now = time.Now
 	}
-	return Phase2BPipeline{registry: registry, executor: executor, now: now}
+	return Phase2BPipeline{registry: registry, executor: executor, now: now, reduce: ReduceEvidenceResults}
+}
+
+func (pipeline Phase2BPipeline) reduceEvidence(route InvestigationRoute, question string, requirements []EvidenceRequirement, plan EvidencePlan, results []EvidenceResult) (InvestigationEvidence, error) {
+	reduce := pipeline.reduce
+	if reduce == nil {
+		reduce = ReduceEvidenceResults
+	}
+	return reduce(route, question, requirements, plan, results, pipeline.registry)
 }
 
 func (pipeline Phase2BPipeline) Prepare(question string, routerContext ShadowRouterContext) (Phase2BPrepared, error) {
@@ -69,13 +86,83 @@ func (pipeline Phase2BPipeline) ExecutePrepared(ctx context.Context, prepared Ph
 	if prepared.Route.Resolution != RouteResolutionSupported {
 		return Phase2BResult{}, fmt.Errorf("phase2b route is %s: %s", prepared.Route.Resolution, prepared.Route.Reason)
 	}
+	if err := ctx.Err(); err != nil {
+		return Phase2BResult{}, err
+	}
 	executor := NewEvidenceExecutor(pipeline.registry, pipeline.executor, pipeline.now)
-	results, err := executor.Execute(ctx, prepared.Plan)
+	firstResults, err := executor.Execute(ctx, prepared.Plan)
 	if err != nil {
 		return Phase2BResult{}, err
 	}
-	evidence, err := ReduceEvidenceResults(prepared.Route.RouteDescriptor(), prepared.NormalizedQuestion, prepared.Route.Requirements, prepared.Plan, results, pipeline.registry)
+	if err := ctx.Err(); err != nil {
+		return Phase2BResult{}, err
+	}
+	firstEvidence, err := pipeline.reduceEvidence(
+		prepared.Route.RouteDescriptor(), prepared.NormalizedQuestion,
+		prepared.Route.Requirements, prepared.Plan, firstResults,
+	)
 	if err != nil {
+		return Phase2BResult{}, err
+	}
+	firstEvidence = ApplyEvidenceConfidence(firstEvidence)
+
+	plan := prepared.Plan
+	results := firstResults
+	evidence := firstEvidence
+	evidenceRounds := 1
+	secondRoundReads := 0
+	processingLimitation := ""
+	secondRound := PlanSecondEvidenceRound(prepared, firstEvidence, prepared.Plan, firstResults, pipeline.registry)
+	if secondRound.Needed {
+		if err := ctx.Err(); err != nil {
+			return Phase2BResult{}, err
+		}
+		followUpResults, executeErr := executor.Execute(ctx, secondRound.Plan)
+		if err := ctx.Err(); err != nil {
+			return Phase2BResult{}, err
+		}
+		if executeErr != nil {
+			secondRound.Reason = FollowUpExecutionFailed
+		} else {
+			// Record successful execution before attempting any later reduction.
+			// A reducer failure must not erase reads that already ran.
+			plan = combineEvidencePlans(prepared.Plan, secondRound.Plan, nil)
+			results = combineEvidenceResults(firstResults, followUpResults)
+			evidenceRounds = 2
+			secondRoundReads = len(followUpResults)
+
+			followUpEvidence, reduceErr := pipeline.reduceEvidence(
+				prepared.Route.RouteDescriptor(), prepared.NormalizedQuestion,
+				prepared.Route.Requirements, secondRound.Plan, followUpResults,
+			)
+			if reduceErr != nil {
+				secondRound.Reason = FollowUpReductionFailed
+				processingLimitation = string(FollowUpReductionFailed)
+			} else {
+				resolved := resolvedFollowUpRequirements(followUpEvidence)
+				combinedPlan := combineEvidencePlans(prepared.Plan, secondRound.Plan, resolved)
+				combinedEvidence, combineErr := pipeline.reduceEvidence(
+					prepared.Route.RouteDescriptor(), prepared.NormalizedQuestion,
+					prepared.Route.Requirements, combinedPlan, results,
+				)
+				if combineErr != nil {
+					secondRound.Reason = FollowUpReductionFailed
+					processingLimitation = string(FollowUpReductionFailed)
+				} else {
+					combinedEvidence.Missing = filterResolvedPriorMissing(combinedEvidence.Missing, firstEvidence.Missing, resolved)
+					combinedEvidence, combineErr = NormalizeInvestigationEvidence(combinedEvidence)
+					if combineErr != nil {
+						secondRound.Reason = FollowUpReductionFailed
+						processingLimitation = string(FollowUpReductionFailed)
+					} else {
+						plan = combinedPlan
+						evidence = combinedEvidence
+					}
+				}
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil {
 		return Phase2BResult{}, err
 	}
 	evidence = ApplyEvidenceConfidence(evidence)
@@ -88,8 +175,10 @@ func (pipeline Phase2BPipeline) ExecutePrepared(ctx context.Context, prepared Ph
 		return Phase2BResult{}, err
 	}
 	return Phase2BResult{
-		Route: prepared.Route, Plan: prepared.Plan, Results: results,
+		Route: prepared.Route, Plan: plan, Results: results,
 		Evidence: evidence, Packet: packet, PacketJSON: packetJSON,
+		EvidenceRounds: evidenceRounds, SecondRoundReads: secondRoundReads,
+		EvidenceProcessingLimitation: processingLimitation, SecondRound: secondRound,
 	}, nil
 }
 

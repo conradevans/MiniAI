@@ -46,6 +46,7 @@ type app struct {
 
 	phase2Executor     capabilityExecutor
 	phase2Now          func() time.Time
+	phase2Reducer      evidenceReductionFunc
 	systemStatusReader func() (systemStatus, error)
 	ollamaStatusReader func(context.Context) ollamaStatus
 
@@ -581,11 +582,6 @@ func (a *app) handleSelectedModelChatStream(w http.ResponseWriter, r *http.Reque
 		a.handlePreparedDiagnosticStream(w, r, req.Message, policy, preparedDiagnostic)
 		return
 	}
-	if shouldUseAgentTools(req.Message) {
-		a.handleAgentChatStream(w, r, req, policy, history)
-		return
-	}
-
 	prompt, contextApps := a.buildContextualPrompt(r.Context(), req.Message, history)
 
 	flusher, ok := w.(http.Flusher)

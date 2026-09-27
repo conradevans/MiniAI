@@ -341,8 +341,12 @@ func TestPhase2CExactUnsupportedAndAmbiguousBoundaries(t *testing.T) {
 	if h.app.handlePhase2CStream(httptest.NewRecorder(), r, "What commit is My Scheduler running?", nil) {
 		t.Fatal("exact fact entered reasoner")
 	}
-	if h.app.handlePhase2CStream(httptest.NewRecorder(), r, "Compare My Scheduler versus another application.", nil) {
-		t.Fatal("unsupported comparison entered Phase 2C")
+	unsupported := httptest.NewRecorder()
+	if !h.app.handlePhase2CStream(unsupported, r, "Compare My Scheduler versus another application.", nil) {
+		t.Fatal("recognized unsupported local comparison was not handled deterministically")
+	}
+	if !strings.Contains(unsupported.Body.String(), `"limitation":"unsupported_local_evidence"`) {
+		t.Fatalf("unsupported stream=%s", unsupported.Body.String())
 	}
 	if len(h.requests()) != 0 || len(h.executor.names()) != 0 {
 		t.Fatalf("calls tools=%v model=%d", h.executor.names(), len(h.requests()))
@@ -685,11 +689,69 @@ func TestPhase2CCancellationRestoresLease(t *testing.T) {
 
 func TestPhase2CBlockedPolicyNeverAcquiresLease(t *testing.T) {
 	h := newPhase2CTestHarness(t, 5)
+	executor := &platformPipelineExecutor{}
+	h.app.phase2Executor = executor
 	rr := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/api/v1/chat/stream", nil)
 	h.app.handlePhase2CStream(rr, r, "Is the Dell healthy right now?", nil)
-	if len(h.executor.names()) == 0 || len(h.requests()) != 0 || len(h.runner.commands()) != 0 || rr.Code != http.StatusServiceUnavailable {
-		t.Fatalf("tools=%v model=%d lease=%v status=%d", h.executor.names(), len(h.requests()), h.runner.commands(), rr.Code)
+	events := phase2CToolEvents(t, rr.Body.String())
+	if executor.calls != 1 || len(events) != 2 || events[0].Phase != "start" || events[1].Phase != "result" ||
+		len(h.requests()) != 0 || len(h.runner.commands()) != 0 {
+		t.Fatalf("reads=%d events=%+v model=%d lease=%v stream=%s",
+			executor.calls, events, len(h.requests()), h.runner.commands(), rr.Body.String())
+	}
+	for _, marker := range []string{
+		`"limitation":"model_policy_blocked"`, `"model_invoked":false`, `"reasoner_calls":0`,
+		`"evidence_rounds":1`, `"second_round_reads":0`,
+	} {
+		if !strings.Contains(rr.Body.String(), marker) {
+			t.Fatalf("missing %s in stream=%s", marker, rr.Body.String())
+		}
+	}
+}
+
+func TestPhase2CTwoRoundEvidenceEventsSurvivePolicyBlock(t *testing.T) {
+	h := newPhase2CTestHarness(t, 5)
+	now := h.app.phase2CNow()
+	executor := &phase2DTestExecutor{handler: phase2DDatabaseHandler(
+		now, []reactorLabDatabase{{ID: "database_123", DisplayName: "Primary", Status: "ready"}}, nil,
+	)}
+	h.app.phase2Executor = executor
+	rr := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/chat/stream", nil)
+	h.app.handlePhase2CStream(rr, r, "Are the database backups healthy?", nil)
+
+	events := phase2CToolEvents(t, rr.Body.String())
+	if calls := executor.recordedCalls(); len(calls) != 2 || len(events) != 4 ||
+		len(h.reasonerRequests()) != 0 || len(h.plannerRequests()) != 0 || len(h.runner.commands()) != 0 {
+		t.Fatalf("calls=%+v events=%+v reasoner=%d planner=%d lease=%v stream=%s",
+			calls, events, len(h.reasonerRequests()), len(h.plannerRequests()), h.runner.commands(), rr.Body.String())
+	}
+	for _, marker := range []string{
+		`"limitation":"model_policy_blocked"`, `"reasoner_calls":0`,
+		`"evidence_rounds":2`, `"second_round_reads":1`,
+	} {
+		if !strings.Contains(rr.Body.String(), marker) {
+			t.Fatalf("missing %s in stream=%s", marker, rr.Body.String())
+		}
+	}
+}
+
+func TestPhase2CCompletedEvidenceEventsSurviveOllamaUnavailable(t *testing.T) {
+	h := newPhase2CTestHarness(t, 12)
+	executor := &platformPipelineExecutor{}
+	h.app.phase2Executor = executor
+	h.app.ollamaStatusReader = func(context.Context) ollamaStatus { return ollamaStatus{Reachable: false} }
+	rr := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/chat/stream", nil)
+	h.app.handlePhase2CStream(rr, r, "Is the Dell healthy right now?", nil)
+
+	events := phase2CToolEvents(t, rr.Body.String())
+	if executor.calls != 1 || len(events) != 2 || len(h.requests()) != 0 || len(h.runner.commands()) != 0 ||
+		!strings.Contains(rr.Body.String(), `"limitation":"ollama_unavailable"`) ||
+		!strings.Contains(rr.Body.String(), `"reasoner_calls":0`) {
+		t.Fatalf("reads=%d events=%+v model=%d lease=%v stream=%s",
+			executor.calls, events, len(h.requests()), h.runner.commands(), rr.Body.String())
 	}
 }
 
@@ -726,6 +788,24 @@ func TestPhase2COriginalPlatformHealthQuestionUsesOnePassArchitecture(t *testing
 	h.app.handleChatStream(rr, r)
 	if len(h.requests()) != 1 || !strings.Contains(rr.Body.String(), `"answer_mode":"phase2c"`) || !strings.Contains(rr.Body.String(), `"planner_calls":0`) {
 		t.Fatalf("requests=%d stream=%s", len(h.requests()), rr.Body.String())
+	}
+}
+
+func TestPhase2DProductionCompletePlatformEvidenceStaysOneRound(t *testing.T) {
+	h := newPhase2CTestHarness(t, 12)
+	executor := &platformPipelineExecutor{}
+	h.app.phase2Executor = executor
+	stream := h.runChat(t, "complete-platform-session", "", "Is the Dell healthy right now?")
+	if executor.calls != 1 || len(h.reasonerRequests()) != 1 || len(h.plannerRequests()) != 0 {
+		t.Fatalf("reads=%d reasoner=%d planner=%d stream=%s",
+			executor.calls, len(h.reasonerRequests()), len(h.plannerRequests()), stream)
+	}
+	for _, marker := range []string{
+		`"evidence_rounds":1`, `"second_round_reads":0`, `"planner_calls":0`, `"reasoner_calls":1`,
+	} {
+		if !strings.Contains(stream, marker) {
+			t.Fatalf("missing %s in stream=%s", marker, stream)
+		}
 	}
 }
 
@@ -769,8 +849,16 @@ func TestPhase2CProductionOrchestrationRoutesSupportedInvestigations(t *testing.
 	}{
 		{name: "platform health", question: "Is the Dell healthy right now?", route: RouteCurrentPlatformHealth},
 		{name: "platform doing", question: "How is the Dell doing right now?", route: RouteCurrentPlatformHealth},
+		{name: "ReactorLab doing", question: "How is ReactorLab doing right now?", route: RouteCurrentPlatformHealth},
+		{name: "ReactorLab health", question: "Is ReactorLab healthy?", route: RouteCurrentPlatformHealth},
+		{name: "platform happening", question: "What is happening on the Dell right now?", route: RouteCurrentPlatformHealth},
 		{name: "thermal history", question: "Has the Dell been overheating today?", route: RouteThermalInvestigation},
 		{name: "restart recovery", question: "Why did the Dell restart yesterday?", route: RouteRestartInvestigation},
+		{name: "application current", question: "Is MyScheduler healthy?", route: RouteApplicationCurrent},
+		{name: "application performance", question: "Why is MyScheduler slow right now?", route: RouteApplicationPerformance},
+		{name: "deployment correlation", question: "Did the last MyScheduler deployment cause this outage?", route: RouteDeploymentCorrelation},
+		{name: "database backup", question: "Are the database backups healthy?", route: RouteDatabaseInvestigation},
+		{name: "repository interpretation", question: "Investigate where MyScheduler login is implemented in source code.", route: RouteRepositoryInvestigation},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -785,6 +873,193 @@ func TestPhase2CProductionOrchestrationRoutesSupportedInvestigations(t *testing.
 				t.Fatalf("stream=%s", stream)
 			}
 		})
+	}
+}
+
+func TestPhase2DProductionSecondRoundUsesOneReasonerAndPairedToolEvents(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		backupError error
+	}{
+		{name: "resolved gap"},
+		{name: "failed follow-up remains bounded", backupError: errReactorLabUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			h := newPhase2CTestHarness(t, 12)
+			now := h.app.phase2CNow()
+			executor := &phase2DTestExecutor{handler: phase2DDatabaseHandler(
+				now, []reactorLabDatabase{{ID: "database_123", DisplayName: "MyScheduler Production", Status: "ready"}}, test.backupError,
+			)}
+			h.app.phase2Executor = executor
+
+			stream := h.runChat(t, "second-round-session", "", "Are the database backups healthy?")
+			calls := executor.recordedCalls()
+			if len(calls) != 2 || calls[0].Name != "list_databases" || calls[1].Name != "read_database_backups" {
+				t.Fatalf("follow-up reads=%+v stream=%s", calls, stream)
+			}
+			if len(h.reasonerRequests()) != 1 || len(h.plannerRequests()) != 0 || len(h.generations()) != 0 {
+				t.Fatalf("reasoner=%d planner=%d direct=%d stream=%s",
+					len(h.reasonerRequests()), len(h.plannerRequests()), len(h.generations()), stream)
+			}
+			if test.backupError != nil && strings.Contains(stream, string(FollowUpReductionFailed)) {
+				t.Fatalf("capability failure was mislabeled as reduction failure: %s", stream)
+			}
+			for _, marker := range []string{
+				`"evidence_rounds":2`, `"second_round_reads":1`, `"planner_calls":0`, `"reasoner_calls":1`,
+			} {
+				if !strings.Contains(stream, marker) {
+					t.Fatalf("missing %s in stream=%s", marker, stream)
+				}
+			}
+
+			starts, results := map[string]string{}, map[string]string{}
+			for _, event := range phase2CToolEvents(t, stream) {
+				switch event.Phase {
+				case "start":
+					starts[event.RequestID] = event.Name
+				case "result":
+					results[event.RequestID] = event.Name
+				}
+			}
+			if len(starts) != 2 || !reflect.DeepEqual(starts, results) {
+				t.Fatalf("unpaired second-round tool events: starts=%v results=%v", starts, results)
+			}
+		})
+	}
+}
+
+func TestPhase2DReductionFailurePreservesExecutedSecondRound(t *testing.T) {
+	h := newPhase2CTestHarness(t, 12)
+	now := h.app.phase2CNow()
+	executor := &phase2DTestExecutor{handler: phase2DDatabaseHandler(
+		now, []reactorLabDatabase{{ID: "database_123", DisplayName: "Primary", Status: "ready"}}, nil,
+	)}
+	h.app.phase2Executor = executor
+	reductions := 0
+	h.app.phase2Reducer = func(route InvestigationRoute, question string, requirements []EvidenceRequirement, plan EvidencePlan, results []EvidenceResult, registry capabilityRegistry) (InvestigationEvidence, error) {
+		reductions++
+		if reductions == 3 {
+			return InvestigationEvidence{}, errors.New("synthetic combined reduction failure")
+		}
+		return ReduceEvidenceResults(route, question, requirements, plan, results, registry)
+	}
+
+	stream := h.runChat(t, "reduction-failure-session", "", "Are the database backups healthy?")
+	events := phase2CToolEvents(t, stream)
+	if calls := executor.recordedCalls(); len(calls) != 2 || reductions != 3 || len(events) != 4 {
+		t.Fatalf("calls=%+v reductions=%d events=%+v stream=%s", calls, reductions, events, stream)
+	}
+	if len(h.reasonerRequests()) != 0 || len(h.plannerRequests()) != 0 || len(h.generations()) != 0 || len(h.runner.commands()) != 0 {
+		t.Fatalf("reduction failure escaped safe path: reasoner=%d planner=%d direct=%d lease=%v stream=%s",
+			len(h.reasonerRequests()), len(h.plannerRequests()), len(h.generations()), h.runner.commands(), stream)
+	}
+	for _, marker := range []string{
+		`"limitation":"follow_up_reduction_failed"`, `"evidence_rounds":2`,
+		`"second_round_reads":1`, `"reasoner_calls":0`, `"planner_calls":0`,
+	} {
+		if !strings.Contains(stream, marker) {
+			t.Fatalf("missing %s in stream=%s", marker, stream)
+		}
+	}
+	starts, results := map[string]string{}, map[string]string{}
+	for _, event := range events {
+		if event.Phase == "start" {
+			starts[event.RequestID] = event.Name
+		} else if event.Phase == "result" {
+			results[event.RequestID] = event.Name
+		}
+	}
+	if len(starts) != 2 || !reflect.DeepEqual(starts, results) {
+		t.Fatalf("executed reads were not preserved as paired events: starts=%v results=%v", starts, results)
+	}
+}
+
+func TestPhase2DProductionCancellationPreventsFollowUpOrReasoner(t *testing.T) {
+	t.Run("before follow-up", func(t *testing.T) {
+		h := newPhase2CTestHarness(t, 12)
+		ctx, cancel := context.WithCancel(context.Background())
+		now := h.app.phase2CNow()
+		executor := &phase2DTestExecutor{handler: func(_ context.Context, name string, _ map[string]any) (any, string, error) {
+			if name != "list_databases" {
+				return nil, "", fmt.Errorf("unexpected capability %s", name)
+			}
+			cancel()
+			return reactorLabDatabaseList{
+				CollectedAt: now, Databases: []reactorLabDatabase{{ID: "database_123"}}, TotalDatabases: 1,
+			}, "databases", nil
+		}}
+		h.app.phase2Executor = executor
+		r := httptest.NewRequest(http.MethodPost, "/api/v1/chat/stream", nil).WithContext(ctx)
+		if !h.app.handlePhase2CStream(httptest.NewRecorder(), r, "Are the database backups healthy?", nil) {
+			t.Fatal("supported request was not handled")
+		}
+		if calls := executor.recordedCalls(); len(calls) != 1 || calls[0].Name != "list_databases" {
+			t.Fatalf("read launched after cancellation: %+v", calls)
+		}
+		if len(h.requests()) != 0 || len(h.runner.commands()) != 0 {
+			t.Fatalf("canceled request invoked model: requests=%d lease=%v", len(h.requests()), h.runner.commands())
+		}
+	})
+
+	t.Run("during follow-up", func(t *testing.T) {
+		h := newPhase2CTestHarness(t, 12)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		now := h.app.phase2CNow()
+		started := make(chan struct{})
+		executor := &phase2DTestExecutor{handler: func(ctx context.Context, name string, _ map[string]any) (any, string, error) {
+			switch name {
+			case "list_databases":
+				return reactorLabDatabaseList{
+					CollectedAt: now, Databases: []reactorLabDatabase{{ID: "database_123"}}, TotalDatabases: 1,
+				}, "databases", nil
+			case "read_database_backups":
+				close(started)
+				<-ctx.Done()
+				return nil, "", ctx.Err()
+			default:
+				return nil, "", fmt.Errorf("unexpected capability %s", name)
+			}
+		}}
+		h.app.phase2Executor = executor
+		r := httptest.NewRequest(http.MethodPost, "/api/v1/chat/stream", nil).WithContext(ctx)
+		done := make(chan bool, 1)
+		go func() {
+			done <- h.app.handlePhase2CStream(httptest.NewRecorder(), r, "Are the database backups healthy?", nil)
+		}()
+		<-started
+		cancel()
+		select {
+		case handled := <-done:
+			if !handled {
+				t.Fatal("supported request was not handled")
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("canceled production follow-up leaked a goroutine")
+		}
+		if calls := executor.recordedCalls(); len(calls) != 2 {
+			t.Fatalf("unexpected reads: %+v", calls)
+		}
+		if len(h.requests()) != 0 || len(h.runner.commands()) != 0 {
+			t.Fatalf("canceled request invoked model: requests=%d lease=%v", len(h.requests()), h.runner.commands())
+		}
+	})
+}
+
+func TestPhase2DProductionUnsupportedLocalEvidenceIsDeterministic(t *testing.T) {
+	h := newPhase2CTestHarness(t, 12)
+	stream := h.runChat(t, "unsupported-local-session", "", "Compare MyScheduler versus Golf Mullet right now.")
+	if len(h.requests()) != 0 || len(h.generations()) != 0 || len(h.executor.names()) != 0 || len(h.runner.commands()) != 0 {
+		t.Fatalf("unsupported local request escaped deterministic path: chat=%d direct=%d tools=%v lease=%v stream=%s",
+			len(h.requests()), len(h.generations()), h.executor.names(), h.runner.commands(), stream)
+	}
+	for _, marker := range []string{
+		`"answer_mode":"deterministic"`, `"limitation":"unsupported_local_evidence"`,
+		`"model_invoked":false`, `"planner_calls":0`, `"reasoner_calls":0`,
+	} {
+		if !strings.Contains(stream, marker) {
+			t.Fatalf("missing %s in stream=%s", marker, stream)
+		}
 	}
 }
 
@@ -836,16 +1111,21 @@ func TestPhase2CProductionOrdinaryConversationStaysDirect(t *testing.T) {
 		"Write a poem about MyScheduler.",
 		"Tell me a joke about Golf Mullet.",
 		"Explain database normalization.",
+		"What is PostgreSQL?",
 		"What is a repository?",
+		"Compare PostgreSQL and MySQL.",
+		"Explain deployments.",
+		"Write me a function that reverses a string.",
+		"Compare Java and Go.",
 	} {
 		t.Run(question, func(t *testing.T) {
 			h := newPhase2CTestHarness(t, 12)
 			stream := h.runChat(t, "ordinary-session", "", question)
-			if len(h.reasonerRequests()) != 0 || len(h.plannerRequests()) != 0 || len(h.generations()) != 1 {
-				t.Fatalf("reasoner=%d planner=%d direct=%d stream=%s",
-					len(h.reasonerRequests()), len(h.plannerRequests()), len(h.generations()), stream)
+			if len(h.reasonerRequests()) != 0 || len(h.plannerRequests()) != 0 || len(h.generations()) != 1 || len(h.executor.names()) != 0 {
+				t.Fatalf("reasoner=%d planner=%d direct=%d evidence=%v stream=%s",
+					len(h.reasonerRequests()), len(h.plannerRequests()), len(h.generations()), h.executor.names(), stream)
 			}
-			if strings.Contains(stream, "\"answer_mode\":\"phase2c\"") {
+			if strings.Contains(stream, "\"answer_mode\":\"phase2c\"") || strings.Contains(stream, "unsupported_local_evidence") {
 				t.Fatalf("ordinary conversation entered Phase 2C: %s", stream)
 			}
 		})

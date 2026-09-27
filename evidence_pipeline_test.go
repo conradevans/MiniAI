@@ -31,7 +31,7 @@ func TestPhase2BPipelineRunsCompleteShadowFlowWithoutModel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Route.ID != RouteCurrentPlatformHealth || len(result.Plan.Requests) != 1 || len(result.Results) != 1 || len(result.Evidence.Items) != 1 || len(result.PacketJSON) == 0 || fake.calls != 1 {
+	if result.Route.ID != RouteCurrentPlatformHealth || len(result.Plan.Requests) != 1 || len(result.Results) != 1 || len(result.Evidence.Items) != 1 || len(result.PacketJSON) == 0 || fake.calls != 1 || result.EvidenceRounds != 1 || result.SecondRoundReads != 0 {
 		t.Fatalf("pipeline result=%+v calls=%d", result, fake.calls)
 	}
 	if result.Evidence.Confidence.Level != ConfidenceHigh || len(result.PacketJSON) > evidencePacketHardLimitBytes {

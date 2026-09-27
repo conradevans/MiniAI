@@ -361,7 +361,7 @@ func classifyInvestigationGoal(question string) InvestigationGoal {
 			"outage", "failure", "failed", "failing", "error", "crash", "restart", "reboot",
 			"incident", "broken", "issue", "problem", "what changed")):
 		return GoalIncidentExplanation
-	case containsAnyConcept(question, "healthy", "health", "normal", "overheating", "too hot", "doing", "condition", "okay", "ok", "armed") ||
+	case containsAnyConcept(question, "healthy", "health", "normal", "overheating", "too hot", "doing", "condition", "okay", "ok", "armed", "what is happening") ||
 		isCurrentPerformanceAssessment(question):
 		return GoalCurrentAssessment
 	case containsAnyConcept(question, "trend", "over time", "history", "historical",
@@ -426,7 +426,7 @@ func classifyEvidenceDomains(question string) []EvidenceDomain {
 		domain EvidenceDomain
 		terms  []string
 	}{
-		{DomainPlatform, []string{"dell", "host", "platform", "system", "server"}},
+		{DomainPlatform, []string{"reactorlab", "dell", "host", "platform", "system", "server"}},
 		{DomainThermal, []string{"thermal", "temperature", "temperatures", "overheat", "overheating", "too hot"}},
 		{DomainRecovery, []string{"restart", "restarted", "reboot", "rebooted", "recovery", "watchdog", "rtc", "outage"}},
 		{DomainApplication, []string{"app", "application", "service"}},
