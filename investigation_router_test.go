@@ -119,6 +119,54 @@ func TestDeploymentCorrelationRequirements(t *testing.T) {
 	}
 }
 
+func TestApplicationIncidentExplanationUsesHistoricalRoute(t *testing.T) {
+	route := buildShadowInvestigationRoute(
+		"Why has MyScheduler been failing recently?",
+		testShadowRouterContext(),
+	)
+	if route.ID != RouteApplicationPerformance || route.Frame.Goal != GoalIncidentExplanation ||
+		route.Frame.Temporal.Kind != TemporalNamedWindow || route.Frame.Temporal.NamedRange != "24h" ||
+		len(route.Frame.Subjects) != 1 || route.Frame.Subjects[0].ID != "myscheduler" ||
+		!hasDomain(route.Frame, DomainRuntime) {
+		t.Fatalf("historical application incident route=%+v", route)
+	}
+	assertRequirementTypes(t, route, []EvidenceType{
+		EvidenceTypeCurrentApplication,
+		EvidenceTypeApplicationHistory,
+		EvidenceTypeServiceHistory,
+		EvidenceTypeHostHistory,
+		EvidenceTypeRuntimeFailures,
+	})
+
+	for _, question := range []string{
+		"Why is MyScheduler failing?",
+		"Why did MyScheduler fail?",
+	} {
+		decision := buildShadowInvestigationRoute(question, testShadowRouterContext())
+		if decision.ID != RouteApplicationPerformance || decision.Frame.Goal != GoalIncidentExplanation {
+			t.Fatalf("question=%q route=%+v", question, decision)
+		}
+	}
+
+	current := buildShadowInvestigationRoute("Is MyScheduler healthy?", testShadowRouterContext())
+	if current.ID != RouteApplicationCurrent {
+		t.Fatalf("current application route=%+v", current)
+	}
+	deployment := buildShadowInvestigationRoute("Did the MyScheduler deployment cause the outage?", testShadowRouterContext())
+	if deployment.ID != RouteDeploymentCorrelation {
+		t.Fatalf("deployment correlation route=%+v", deployment)
+	}
+}
+
+func TestRuntimeFailureMorphology(t *testing.T) {
+	for _, form := range []string{"fail", "fails", "failed", "failing", "failure", "failures"} {
+		frame := QuestionFrame{Domains: classifyEvidenceDomains("MyScheduler " + form)}
+		if !hasDomain(frame, DomainRuntime) {
+			t.Fatalf("failure form %q did not select runtime domain: %+v", form, frame.Domains)
+		}
+	}
+}
+
 func TestExactFactIsDistinctFromAssessment(t *testing.T) {
 	exact := buildShadowInvestigationRoute("What commit is Golf Mullet running?", testShadowRouterContext())
 	assessment := buildShadowInvestigationRoute("Is Golf Mullet healthy?", testShadowRouterContext())
@@ -222,6 +270,8 @@ func TestTemporalScopeParserDistinguishesSupportedWindows(t *testing.T) {
 		{"during the last 15 minutes", TemporalNamedWindow, "15m"},
 		{"during the last 6 hours", TemporalNamedWindow, "6h"},
 		{"during the last 24 hours", TemporalNamedWindow, "24h"},
+		{"recent", TemporalNamedWindow, "24h"},
+		{"recently", TemporalNamedWindow, "24h"},
 		{"during the last 7 days", TemporalNamedWindow, "7d"},
 		{"from 2026-09-21T10:00:00Z to 2026-09-21T12:00:00Z", TemporalExplicitWindow, ""},
 		{"around incident 2026-09-21T11:00:00Z", TemporalIncidentCentered, ""},

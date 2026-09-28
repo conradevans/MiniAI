@@ -301,17 +301,22 @@ func (a *app) handlePhase2CStream(w http.ResponseWriter, r *http.Request, questi
 	validation := "transport_error"
 	confidence := ConfidenceLow
 	if reasonerErr == nil {
-		draft, validationErr := parseReasonerDraft(reasonerResponse.Message.Content, result.Packet)
-		if validationErr == nil {
-			confidence = result.Evidence.Confidence.SoftwareCeiling
-			if confidence != ConfidenceHigh && confidence != ConfidenceMedium && confidence != ConfidenceLow {
-				confidence = ConfidenceLow
-			}
-			answer = renderReasonerAnswer(draft, confidence)
-			validation = "valid"
+		if completionErr := validateReasonerCompletion(reasonerResponse); completionErr != nil {
+			log.Printf("Phase 2C reasoner validation rejected: %s", safeReasonerValidationError(completionErr))
+			validation = reasonerCompletionValidationStatus(completionErr)
 		} else {
-			log.Printf("Phase 2C reasoner validation rejected: %s", safeReasonerValidationError(validationErr))
-			validation = "invalid"
+			draft, validationErr := parseReasonerDraft(reasonerResponse.Message.Content, result.Packet)
+			if validationErr == nil {
+				confidence = result.Evidence.Confidence.SoftwareCeiling
+				if confidence != ConfidenceHigh && confidence != ConfidenceMedium && confidence != ConfidenceLow {
+					confidence = ConfidenceLow
+				}
+				answer = renderReasonerAnswer(draft, confidence)
+				validation = "valid"
+			} else {
+				log.Printf("Phase 2C reasoner validation rejected: %s", safeReasonerValidationError(validationErr))
+				validation = "invalid"
+			}
 		}
 	}
 	emitBufferedAnswer(w, flusher, answer)

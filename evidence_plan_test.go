@@ -38,6 +38,18 @@ func TestEvidencePlanningRouteMappingsAndCosts(t *testing.T) {
 			frame: QuestionFrame{Subjects: []EvidenceSubject{application}, Temporal: TemporalScope{Kind: TemporalNamedWindow, NamedRange: "7d", Valid: true}},
 			want:  []string{"get_app_context", "read_infrastructure_events", "read_activity", "read_application_history", "read_deployment_history"}, cost: 12,
 		},
+		{
+			name: "application incident", route: RouteApplicationPerformance,
+			frame: QuestionFrame{
+				Goal: GoalIncidentExplanation, Subjects: []EvidenceSubject{application},
+				Domains:  []EvidenceDomain{DomainApplication, DomainRuntime},
+				Temporal: TemporalScope{Kind: TemporalNamedWindow, NamedRange: "24h", Valid: true},
+			},
+			want: []string{
+				"get_app_context", "read_host_history", "read_application_history",
+				"read_service_history", "read_runtime_logs",
+			}, cost: 12,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

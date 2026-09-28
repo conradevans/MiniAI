@@ -435,7 +435,7 @@ func classifyEvidenceDomains(question string) []EvidenceDomain {
 		{DomainInfrastructure, []string{"infrastructure", "event", "events", "activity", "incident"}},
 		{DomainDatabase, []string{"database", "databases", "backup", "backups", "postgres"}},
 		{DomainRepository, []string{"repository", "repo", "source code", "implementation", "which file", "which function"}},
-		{DomainRuntime, []string{"runtime", "log", "logs", "error", "errors", "failure", "failures"}},
+		{DomainRuntime, []string{"runtime", "log", "logs", "error", "errors", "fail", "fails", "failed", "failing", "failure", "failures"}},
 	}
 	var domains []EvidenceDomain
 	for _, entry := range ontology {
@@ -537,8 +537,10 @@ func selectSemanticRoute(frame QuestionFrame) InvestigationRouteID {
 	case hasDomain(frame, DomainApplication) && hasDomain(frame, DomainPerformance) &&
 		(frame.Goal == GoalCurrentAssessment || frame.Goal == GoalTrend || frame.Goal == GoalIncidentExplanation):
 		return RouteApplicationPerformance
+	case hasDomain(frame, DomainApplication) && frame.Goal == GoalIncidentExplanation:
+		return RouteApplicationPerformance
 	case hasDomain(frame, DomainApplication) &&
-		(frame.Goal == GoalCurrentAssessment || frame.Goal == GoalIncidentExplanation):
+		frame.Goal == GoalCurrentAssessment:
 		return RouteApplicationCurrent
 	case hasDomain(frame, DomainPlatform) && frame.Goal == GoalCurrentAssessment:
 		return RouteCurrentPlatformHealth
@@ -628,6 +630,12 @@ func requirementsForRoute(routeID InvestigationRouteID, frame QuestionFrame) []E
 		requirements := make([]EvidenceRequirement, 0, len(profile.Requirements))
 		for _, template := range profile.Requirements {
 			requirements = append(requirements, requirementFromTemplate(template, frame))
+		}
+		if routeID == RouteApplicationPerformance && hasDomain(frame, DomainRuntime) {
+			requirements = append(requirements, requirementFromTemplate(evidenceRequirementTemplate{
+				Type: EvidenceTypeRuntimeFailures, Subject: requirementApplication,
+				Window: windowQuestion24h, Criticality: CriticalityRelevant, Cardinality: CardinalityMany,
+			}, frame))
 		}
 		return requirements
 	}
@@ -776,6 +784,8 @@ func parseTemporalScope(question string, now time.Time, location *time.Location)
 	case containsAnyConcept(normalized, "last 6 hours", "past 6 hours", "six hours", "6h"):
 		return TemporalScope{Kind: TemporalNamedWindow, NamedRange: "6h", Valid: true}
 	case containsAnyConcept(normalized, "last 24 hours", "past 24 hours", "last day", "past day", "24h"):
+		return TemporalScope{Kind: TemporalNamedWindow, NamedRange: "24h", Valid: true}
+	case containsAnyConcept(normalized, "recent", "recently"):
 		return TemporalScope{Kind: TemporalNamedWindow, NamedRange: "24h", Valid: true}
 	case containsAnyConcept(normalized, "last 7 days", "past 7 days", "last week", "7d"):
 		return TemporalScope{Kind: TemporalNamedWindow, NamedRange: "7d", Valid: true}

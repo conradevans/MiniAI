@@ -77,6 +77,46 @@ func TestReasonerDraftValidationRejectsInvalidOutput(t *testing.T) {
 	}
 }
 
+func TestReasonerCompletionValidation(t *testing.T) {
+	if err := validateReasonerCompletion(chatAPIResponse{Done: true, DoneReason: "stop"}); err != nil {
+		t.Fatalf("completed response rejected: %v", err)
+	}
+	if err := validateReasonerCompletion(chatAPIResponse{Done: true, DoneReason: "length"}); err != errReasonerOutputLimitReached ||
+		reasonerCompletionValidationStatus(err) != "output_limit" || safeReasonerValidationError(err) != "output limit reached" {
+		t.Fatalf("length completion classification=%q err=%v", reasonerCompletionValidationStatus(err), err)
+	}
+	if err := validateReasonerCompletion(chatAPIResponse{}); err != errReasonerResponseIncomplete ||
+		reasonerCompletionValidationStatus(err) != "incomplete" || safeReasonerValidationError(err) != "incomplete response" {
+		t.Fatalf("incomplete response classification=%q err=%v", reasonerCompletionValidationStatus(err), err)
+	}
+}
+
+func TestReasonerAcceptsRepresentativeStructuredAnswerBeyondOldEnvelope(t *testing.T) {
+	draft := ReasonerDraft{
+		Conclusion:         strings.Repeat("The bounded evidence records the observed application state. ", 7),
+		ConclusionEvidence: []string{"evidence-1"},
+		Facts: []ReasonerFact{
+			{Text: strings.Repeat("Recorded measurements remain within the observed bounds. ", 4), EvidenceIDs: []string{"evidence-1"}},
+			{Text: strings.Repeat("The current state and historical samples are represented separately. ", 3), EvidenceIDs: []string{"evidence-1"}},
+			{Text: strings.Repeat("The evidence packet preserves the bounded observation window. ", 3), EvidenceIDs: []string{"evidence-1"}},
+		},
+		Uncertainty: []ReasonerFact{{
+			Text:        strings.Repeat("The packet does not include evidence outside the bounded window. ", 3),
+			EvidenceIDs: []string{"evidence-1"},
+		}},
+	}
+	raw, err := json.Marshal(draft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) <= 1024 {
+		t.Fatalf("representative structured response is too small to exercise added output headroom: %d bytes", len(raw))
+	}
+	if _, err := parseReasonerDraft(string(raw), testReasonerPacket()); err != nil {
+		t.Fatalf("representative structured response rejected: %v", err)
+	}
+}
+
 func TestReasonerRejectsUnsupportedDeploymentCausality(t *testing.T) {
 	packet := testReasonerPacket()
 	packet.Route = RouteDeploymentCorrelation
@@ -262,7 +302,7 @@ func TestReasonerRequestIsDeterministicCompactAndToolFree(t *testing.T) {
 	if !bytes.Equal(firstJSON, secondJSON) {
 		t.Fatalf("reasoner requests differ\n%s\n%s", firstJSON, secondJSON)
 	}
-	if len(first.Tools) != 0 || first.Think || first.Stream || first.Options["num_ctx"] != reasonerNumContext || first.Options["num_predict"] != reasonerNumPredict {
+	if reasonerNumPredict != 512 || len(first.Tools) != 0 || first.Think || first.Stream || first.Options["num_ctx"] != reasonerNumContext || first.Options["num_predict"] != reasonerNumPredict {
 		t.Fatalf("request contract=%+v", first)
 	}
 	if len(first.Messages) != 2 || first.Messages[0].Role != "system" || first.Messages[1].Role != "user" {
@@ -427,7 +467,7 @@ func TestOnePassReasonerTransportUsesExactlyOneChatRequest(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
 			t.Fatal(err)
 		}
-		_ = json.NewEncoder(w).Encode(chatAPIResponse{Message: chatMessage{Role: "assistant", Content: validReasonerJSON()}, Done: true})
+		_ = json.NewEncoder(w).Encode(chatAPIResponse{Message: chatMessage{Role: "assistant", Content: validReasonerJSON()}, Done: true, DoneReason: "stop"})
 	}))
 	defer server.Close()
 	packet := testReasonerPacket()
@@ -437,7 +477,7 @@ func TestOnePassReasonerTransportUsesExactlyOneChatRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if calls != 1 || response.Message.Content == "" || received.Model != fallbackModel || len(received.Tools) != 0 || received.Think {
+	if calls != 1 || response.Message.Content == "" || response.DoneReason != "stop" || received.Model != fallbackModel || len(received.Tools) != 0 || received.Think {
 		t.Fatalf("calls=%d response=%+v request=%+v", calls, response, received)
 	}
 	if canonicalJSON(received.Format) != canonicalJSON(reasonerDraftSchema(packet)) {

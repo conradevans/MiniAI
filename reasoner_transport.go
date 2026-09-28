@@ -12,7 +12,7 @@ import (
 
 const (
 	reasonerNumContext = 4096
-	reasonerNumPredict = 256
+	reasonerNumPredict = 512
 )
 
 func (a *app) buildReasonerRequest(model, question string, packet EvidencePacket, packetJSON []byte) chatAPIRequest {

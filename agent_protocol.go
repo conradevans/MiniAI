@@ -44,6 +44,7 @@ type chatAPIRequest struct {
 type chatAPIResponse struct {
 	Message            chatMessage `json:"message"`
 	Done               bool        `json:"done"`
+	DoneReason         string      `json:"done_reason,omitempty"`
 	PromptEvalCount    int         `json:"prompt_eval_count,omitempty"`
 	PromptEvalDuration int64       `json:"prompt_eval_duration,omitempty"`
 	EvalCount          int         `json:"eval_count,omitempty"`

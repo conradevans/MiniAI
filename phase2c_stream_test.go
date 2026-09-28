@@ -42,22 +42,24 @@ func (e *unavailablePhase2Executor) names() []string {
 }
 
 type phase2CTestHarness struct {
-	app              *app
-	executor         *unavailablePhase2Executor
-	runner           *fakePowerHelperRunner
-	reactor          *httptest.Server
-	ollama           *httptest.Server
-	mu               sync.Mutex
-	chatRequests     []chatAPIRequest
-	generateRequests []generateRequest
-	reactorPaths     map[string]int
-	deploymentPort   int
-	responseContent  string
-	responseStatus   int
-	responseBuilder  func(chatAPIRequest) string
-	onGenerate       func(*http.Request)
-	onReasoner       func(*http.Request)
-	onReasonerFinish func()
+	app                *app
+	executor           *unavailablePhase2Executor
+	runner             *fakePowerHelperRunner
+	reactor            *httptest.Server
+	ollama             *httptest.Server
+	mu                 sync.Mutex
+	chatRequests       []chatAPIRequest
+	generateRequests   []generateRequest
+	reactorPaths       map[string]int
+	deploymentPort     int
+	responseContent    string
+	responseStatus     int
+	responseDoneReason string
+	responseEvalCount  int
+	responseBuilder    func(chatAPIRequest) string
+	onGenerate         func(*http.Request)
+	onReasoner         func(*http.Request)
+	onReasonerFinish   func()
 }
 
 func newPhase2CTestHarness(t *testing.T, availableGiB float64) *phase2CTestHarness {
@@ -123,7 +125,7 @@ func newPhase2CTestHarness(t *testing.T, availableGiB float64) *phase2CTestHarne
 			}
 			h.mu.Lock()
 			h.chatRequests = append(h.chatRequests, request)
-			content, status, builder := h.responseContent, h.responseStatus, h.responseBuilder
+			content, status, doneReason, evalCount, builder := h.responseContent, h.responseStatus, h.responseDoneReason, h.responseEvalCount, h.responseBuilder
 			hook, finish := h.onReasoner, h.onReasonerFinish
 			h.mu.Unlock()
 			if request.Format == nil {
@@ -163,9 +165,12 @@ func newPhase2CTestHarness(t *testing.T, availableGiB float64) *phase2CTestHarne
 				encoded, _ := json.Marshal(draft)
 				content = string(encoded)
 			}
+			if evalCount == 0 {
+				evalCount = 20
+			}
 			response, _ := json.Marshal(chatAPIResponse{
-				Message: chatMessage{Role: "assistant", Content: content}, Done: true,
-				PromptEvalCount: 120, PromptEvalDuration: int64(time.Second), EvalCount: 20,
+				Message: chatMessage{Role: "assistant", Content: content}, Done: true, DoneReason: doneReason,
+				PromptEvalCount: 120, PromptEvalDuration: int64(time.Second), EvalCount: evalCount,
 				EvalDuration: int64(time.Second), LoadDuration: int64(250 * time.Millisecond), TotalDuration: int64(2 * time.Second),
 			})
 			if finish != nil {
@@ -305,6 +310,7 @@ func TestPhase2CSupportedRoutesUseBoundedEvidenceAndOneReasonerCall(t *testing.T
 		{"restart", "Why did the Dell restart yesterday?", RouteRestartInvestigation, "read_recovery"},
 		{"application current", "Is My Scheduler healthy?", RouteApplicationCurrent, "get_app_context"},
 		{"application performance", "Is My Scheduler slow today?", RouteApplicationPerformance, "read_application_history"},
+		{"application incident", "Why has MyScheduler been failing recently?", RouteApplicationPerformance, "read_runtime_logs"},
 		{"deployment correlation", "Did the My Scheduler deployment cause the outage?", RouteDeploymentCorrelation, "read_deployment_history"},
 		{"database backup", "Are the database backups healthy?", RouteDatabaseInvestigation, "list_databases"},
 		{"repository interpretation", "Explain where My Scheduler login is implemented in source code.", RouteRepositoryInvestigation, "search_repository"},
@@ -384,6 +390,41 @@ func TestPhase2CRouterContextUsesBoundedConversationSubjectOnlyForIdentity(t *te
 	}
 	if strings.Contains(canonicalJSON(context), "Old state") {
 		t.Fatal("history prose leaked into router context")
+	}
+}
+
+func TestPhase2CProductionRegressionPreparesHistoricalApplicationEvidence(t *testing.T) {
+	h := newPhase2CTestHarness(t, 12)
+	question := "Why has MyScheduler been failing recently?"
+	context := h.app.buildProductionRouterContext(t.Context(), question, nil, h.app.phase2CNow())
+	prepared, err := h.app.phase2CPipeline().Prepare(question, context)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared.Route.ID != RouteApplicationPerformance ||
+		prepared.Route.Frame.Goal != GoalIncidentExplanation ||
+		prepared.Route.Frame.Temporal.Kind != TemporalNamedWindow ||
+		prepared.Route.Frame.Temporal.NamedRange != "24h" ||
+		len(prepared.Route.Frame.Subjects) != 1 ||
+		prepared.Route.Frame.Subjects[0].ID != "myscheduler" {
+		t.Fatalf("route=%+v", prepared.Route)
+	}
+	got := make([]string, 0, len(prepared.Plan.Requests))
+	for _, request := range prepared.Plan.Requests {
+		got = append(got, request.Capability)
+	}
+	want := []string{
+		"get_app_context",
+		"read_host_history",
+		"read_application_history",
+		"read_service_history",
+		"read_runtime_logs",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("capabilities=%v want %v", got, want)
+	}
+	if prepared.Plan.LogicalReads != 5 || prepared.Plan.CostUnits != 12 {
+		t.Fatalf("budget=%d/%d", prepared.Plan.LogicalReads, prepared.Plan.CostUnits)
 	}
 }
 
@@ -523,10 +564,17 @@ func TestPhase2CReasonerOutcomesAttemptExactlyOneRequest(t *testing.T) {
 		configure  func(*phase2CTestHarness)
 		validation string
 	}{
-		{name: "valid", question: "Is the Dell healthy right now?", configure: func(*phase2CTestHarness) {}, validation: "valid"},
+		{name: "valid", question: "Is the Dell healthy right now?", configure: func(h *phase2CTestHarness) {
+			h.responseDoneReason = "stop"
+		}, validation: "valid"},
 		{name: "malformed JSON", question: "Is the Dell healthy right now?", configure: func(h *phase2CTestHarness) {
 			h.responseContent = "{bad"
 		}, validation: "invalid"},
+		{name: "output limited", question: "Is the Dell healthy right now?", configure: func(h *phase2CTestHarness) {
+			h.responseContent = `{"conclusion":"truncated"`
+			h.responseDoneReason = "length"
+			h.responseEvalCount = reasonerNumPredict
+		}, validation: "output_limit"},
 		{name: "schema invalid JSON", question: "Is the Dell healthy right now?", configure: func(h *phase2CTestHarness) {
 			h.responseBuilder = func(request chatAPIRequest) string {
 				packet, _ := evidencePacketFromReasonerRequest(request)
@@ -869,6 +917,7 @@ func TestPhase2CProductionOrchestrationRoutesSupportedInvestigations(t *testing.
 		{name: "restart recovery", question: "Why did the Dell restart yesterday?", route: RouteRestartInvestigation},
 		{name: "application current", question: "Is MyScheduler healthy?", route: RouteApplicationCurrent},
 		{name: "application performance", question: "Why is MyScheduler slow right now?", route: RouteApplicationPerformance},
+		{name: "application incident", question: "Why has MyScheduler been failing recently?", route: RouteApplicationPerformance},
 		{name: "deployment correlation", question: "Did the last MyScheduler deployment cause this outage?", route: RouteDeploymentCorrelation},
 		{name: "database backup", question: "Are the database backups healthy?", route: RouteDatabaseInvestigation},
 		{name: "repository interpretation", question: "Investigate where MyScheduler login is implemented in source code.", route: RouteRepositoryInvestigation},

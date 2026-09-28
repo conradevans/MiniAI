@@ -93,6 +93,29 @@ func TestPhase2DCompletePlatformEvidenceStaysOneRound(t *testing.T) {
 	}
 }
 
+func TestPhase2DCompleteApplicationIncidentEvidenceStaysOneRound(t *testing.T) {
+	now := phase2DNow()
+	pipeline := NewPhase2BPipeline(phase0CapabilityRegistry(), nil, func() time.Time { return now })
+	prepared, err := pipeline.Prepare(
+		"Why has MyScheduler been failing recently?",
+		ShadowRouterContext{Now: now, Location: time.UTC, Entities: testShadowRouterContext().Entities},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := PlanSecondEvidenceRound(
+		prepared,
+		InvestigationEvidence{Requirements: prepared.Route.Requirements},
+		prepared.Plan,
+		nil,
+		pipeline.registry,
+	)
+	if prepared.Route.ID != RouteApplicationPerformance || prepared.Plan.LogicalReads != 5 ||
+		prepared.Plan.CostUnits != 12 || decision.Needed || decision.Reason != FollowUpNoMaterialGap {
+		t.Fatalf("complete application incident triggered follow-up: prepared=%+v decision=%+v", prepared, decision)
+	}
+}
+
 func TestPhase2DTypedDatabaseGapRunsOneBoundedFollowUpRound(t *testing.T) {
 	now := phase2DNow()
 	executor := &phase2DTestExecutor{}
