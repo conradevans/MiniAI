@@ -269,8 +269,8 @@ func sanitizeHistoryEvidenceReads(reads []HistoryEvidenceRead) []HistoryEvidence
 		}
 		read.ID = 0
 		read.RequestID = sanitizeHistoryText(read.RequestID, 160)
-		if read.EvidenceRound < 1 || read.EvidenceRound > 2 {
-			read.EvidenceRound = 1
+		if read.EvidenceRound < 0 || read.EvidenceRound > 2 {
+			read.EvidenceRound = 0
 		}
 		read.Order = index
 		read.Capability = capability

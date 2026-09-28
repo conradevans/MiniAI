@@ -119,6 +119,9 @@ func (s *chatStore) finalizeHistoryEntry(id string, input historyFinalizeInput) 
 	input.ResultText, resultRedacted, resultTruncated = sanitizeHistoryAuditText(input.ResultText, historyResultMaxRunes)
 	input.Targets = sanitizeHistoryTargets(input.Targets)
 	input.EvidenceReads = sanitizeHistoryEvidenceReads(input.EvidenceReads)
+	if len(input.EvidenceReads) > input.Metadata.ToolCalls {
+		input.Metadata.ToolCalls = len(input.EvidenceReads)
+	}
 	input.Metadata = sanitizeHistoryMetadata(input.Metadata)
 
 	tx, err := s.db.Begin()

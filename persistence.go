@@ -276,7 +276,10 @@ func (w *sseCaptureWriter) capturedHistoryReads(finalStatus HistoryStatus) []His
 	}
 	reads := make([]HistoryEvidenceRead, 0, len(w.pending))
 	for index, pending := range w.pending {
-		round := 1
+		round := 0
+		if w.metadata.EvidenceRounds >= 1 {
+			round = 1
+		}
 		if w.metadata.EvidenceRounds >= 2 && index >= secondRoundStart {
 			round = 2
 		}

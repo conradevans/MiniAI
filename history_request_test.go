@@ -64,6 +64,48 @@ func TestDirectConversationCreatesOneLinkedHistoryEntry(t *testing.T) {
 	}
 }
 
+func TestDeterministicStructuredLookupUsesNonPhase2HistoryRound(t *testing.T) {
+	a, cleanup := newDiagnosticTestApp(t, []any{healthyMySchedulerDeployment()}, nil, "", "")
+	defer cleanup()
+	modelCalls := 0
+	ollama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		modelCalls++
+		http.Error(w, "unexpected Ollama request", http.StatusInternalServerError)
+	}))
+	defer ollama.Close()
+	a.ollamaURL = ollama.URL
+	now := time.Now()
+	a.sessions = map[string]*session{
+		"history-deterministic-structured": {
+			ID: "history-deterministic-structured", CreatedAt: now, LastHeartbeat: now, LastChat: now,
+		},
+	}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/chat/stream", strings.NewReader(
+		`{"session_id":"history-deterministic-structured","message":"Is MyScheduler running?"}`,
+	))
+	a.handleChatStream(recorder, request)
+	stream := recorder.Body.String()
+	entries := allHistoryEntries(t, a.store)
+	if len(entries) != 1 {
+		t.Fatalf("history=%+v stream=%s", entries, stream)
+	}
+	entry := entries[0]
+	if entry.Kind != HistoryKindInvestigation || entry.Status != HistoryStatusSucceeded ||
+		entry.AnswerMode != "deterministic" || entry.ModelInvoked || entry.PlannerCalls != 0 || entry.ReasonerCalls != 0 ||
+		entry.EvidenceRounds != 0 || entry.SecondRoundReads != 0 || entry.ToolCalls != 1 ||
+		len(entry.EvidenceReads) != 1 || entry.EvidenceReads[0].EvidenceRound != 0 ||
+		entry.EvidenceReads[0].Capability != "get_app_context" {
+		t.Fatalf("deterministic History audit=%+v", entry)
+	}
+	if !strings.Contains(stream, `"tool_calls":0`) {
+		t.Fatalf("deterministic SSE semantics changed: %s", stream)
+	}
+	if modelCalls != 0 {
+		t.Fatalf("deterministic lookup invoked model %d times", modelCalls)
+	}
+}
+
 func TestOneAndTwoRoundInvestigationsCreateOneParentRecord(t *testing.T) {
 	t.Run("one round", func(t *testing.T) {
 		h := newPhase2CTestHarness(t, 12)
@@ -84,6 +126,10 @@ func TestOneAndTwoRoundInvestigationsCreateOneParentRecord(t *testing.T) {
 			entry.EvidenceReads[0].RequestID == "" || entry.EvidenceReads[0].StartedAt != nil || entry.EvidenceReads[0].CompletedAt != nil {
 			t.Fatalf("one-round history=%+v", entry)
 		}
+		if len(h.reasonerRequests()) != 1 || len(h.plannerRequests()) != 0 || len(h.generations()) != 0 {
+			t.Fatalf("one-round model calls: reasoner=%d planner=%d direct=%d",
+				len(h.reasonerRequests()), len(h.plannerRequests()), len(h.generations()))
+		}
 	})
 
 	t.Run("two rounds", func(t *testing.T) {
@@ -99,7 +145,8 @@ func TestOneAndTwoRoundInvestigationsCreateOneParentRecord(t *testing.T) {
 			t.Fatalf("history=%+v", entries)
 		}
 		entry := entries[0]
-		if entry.EvidenceRounds != 2 || entry.SecondRoundReads != 1 || entry.PlannerCalls != 0 || entry.ReasonerCalls != 1 || len(entry.EvidenceReads) != 2 {
+		if entry.EvidenceRounds != 2 || entry.SecondRoundReads != 1 || entry.ToolCalls != 2 ||
+			entry.PlannerCalls != 0 || entry.ReasonerCalls != 1 || len(entry.EvidenceReads) != 2 {
 			t.Fatalf("two-round history=%+v", entry)
 		}
 		if entry.EvidenceReads[0].EvidenceRound != 1 || entry.EvidenceReads[1].EvidenceRound != 2 ||
@@ -107,6 +154,10 @@ func TestOneAndTwoRoundInvestigationsCreateOneParentRecord(t *testing.T) {
 			entry.EvidenceReads[0].StartedAt != nil || entry.EvidenceReads[0].CompletedAt != nil ||
 			entry.EvidenceReads[1].StartedAt != nil || entry.EvidenceReads[1].CompletedAt != nil {
 			t.Fatalf("round children=%+v", entry.EvidenceReads)
+		}
+		if len(h.reasonerRequests()) != 1 || len(h.plannerRequests()) != 0 || len(h.generations()) != 0 {
+			t.Fatalf("two-round model calls: reasoner=%d planner=%d direct=%d",
+				len(h.reasonerRequests()), len(h.plannerRequests()), len(h.generations()))
 		}
 	})
 }

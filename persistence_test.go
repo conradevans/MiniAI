@@ -81,7 +81,7 @@ func TestSSECaptureDoesNotInventEvidenceExecutionTimestamps(t *testing.T) {
 	time.Sleep(5 * time.Millisecond)
 	sendSSE(capture, "tool", agentToolEvent{RequestID: "request-1", Phase: "result", Name: "get_platform_overview", Summary: "complete"})
 	reads := capture.capturedHistoryReads(HistoryStatusSucceeded)
-	if len(reads) != 1 || reads[0].StartedAt != nil || reads[0].CompletedAt != nil {
+	if len(reads) != 1 || reads[0].EvidenceRound != 0 || reads[0].StartedAt != nil || reads[0].CompletedAt != nil {
 		t.Fatalf("SSE emission times were represented as execution times: %+v", reads)
 	}
 }
