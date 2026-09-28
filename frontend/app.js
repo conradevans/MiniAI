@@ -11,6 +11,8 @@
     elapsedTimer: null,
     sendStarted: 0,
     liveToolEvents: [],
+    historyCache: new Map(),
+    historyRequests: new Map(),
   };
 
   const $ = (id) => document.getElementById(id);
@@ -220,7 +222,7 @@
 
   function appendStoredMessage(message) {
     if (message.role === 'user') appendUser(message.content);
-    if (message.role === 'assistant') appendAssistant(message.content, message.evidence || []);
+    if (message.role === 'assistant') appendAssistant(message.content, message.evidence || [], message.history_entry_id);
   }
 
   function appendUser(content) {
@@ -235,7 +237,7 @@
     scrollBottom();
   }
 
-  function appendAssistant(content = '', evidence = []) {
+  function appendAssistant(content = '', evidence = [], historyEntryId = '') {
     els.emptyState.hidden = true;
     const wrap = document.createElement('div');
     wrap.className = 'message assistant';
@@ -246,7 +248,9 @@
     body.className = 'assistant-body';
     body.innerHTML = renderMarkdown(content);
     wrap.append(head, body);
-    if (evidence.length) wrap.appendChild(renderEvidence(evidence));
+    const historyId = String(historyEntryId || '').trim();
+    if (historyId) wrap.appendChild(renderExecutionDetails(historyId));
+    else if (evidence.length) wrap.appendChild(renderEvidence(evidence));
     els.conversation.appendChild(wrap);
     wireCopyButtons(wrap);
     return { wrap, body };
@@ -272,6 +276,393 @@
     }
     details.append(summary, list);
     return details;
+  }
+
+  function renderExecutionDetails(historyEntryId) {
+    const historyId = String(historyEntryId || '').trim();
+    const details = document.createElement('details');
+    details.className = 'execution-box';
+    details.dataset.historyId = historyId;
+    const summary = document.createElement('summary');
+    summary.textContent = 'Details';
+    const content = document.createElement('div');
+    content.className = 'execution-content';
+    details.append(summary, content);
+
+    if (state.historyCache.has(historyId)) renderExecutionContent(details, summary, content, state.historyCache.get(historyId));
+    details.addEventListener('toggle', () => {
+      if (details.open && !details.dataset.loaded && !details.dataset.loading) {
+        loadExecutionDetails(details, summary, content, historyId);
+      }
+    });
+    return details;
+  }
+
+  async function fetchHistoryEntry(historyId) {
+    if (state.historyCache.has(historyId)) return state.historyCache.get(historyId);
+    if (state.historyRequests.has(historyId)) return state.historyRequests.get(historyId);
+    const request = api(`/api/v1/history/${encodeURIComponent(historyId)}`)
+      .then((history) => {
+        state.historyCache.set(historyId, history);
+        state.historyRequests.delete(historyId);
+        return history;
+      })
+      .catch((error) => {
+        state.historyRequests.delete(historyId);
+        throw error;
+      });
+    state.historyRequests.set(historyId, request);
+    return request;
+  }
+
+  async function loadExecutionDetails(details, summary, content, historyId) {
+    details.dataset.loading = '1';
+    content.replaceChildren(makeElement('div', 'execution-loading', 'Loading execution details…'));
+    try {
+      const history = await fetchHistoryEntry(historyId);
+      if (!details.isConnected || details.dataset.historyId !== historyId) return;
+      renderExecutionContent(details, summary, content, history);
+    } catch {
+      if (!details.isConnected || details.dataset.historyId !== historyId) return;
+      renderExecutionError(details, summary, content, historyId);
+    } finally {
+      delete details.dataset.loading;
+    }
+  }
+
+  function renderExecutionError(details, summary, content, historyId) {
+    summary.textContent = 'Details';
+    const error = makeElement('div', 'execution-error');
+    error.setAttribute('role', 'status');
+    error.appendChild(makeElement('span', '', 'Execution details unavailable.'));
+    const retry = makeElement('button', 'execution-retry', 'Retry');
+    retry.type = 'button';
+    retry.addEventListener('click', () => loadExecutionDetails(details, summary, content, historyId));
+    error.appendChild(retry);
+    content.replaceChildren(error);
+  }
+
+  function renderExecutionContent(details, summary, content, history) {
+    const reads = Array.isArray(history?.evidence_reads) ? history.evidence_reads : [];
+    summary.textContent = executionSummary(history, reads);
+    content.replaceChildren();
+
+    const execution = makeElement('section', 'execution-section');
+    execution.appendChild(makeElement('h4', 'execution-section-title', 'Execution'));
+    const facts = makeElement('div', 'execution-facts');
+    appendExecutionFact(facts, 'Status', friendlyStatus(history?.status), statusClass(history?.status));
+    const mode = friendlyMode(history);
+    appendExecutionFact(facts, 'Mode', mode);
+    if (history?.model_invoked || mode === 'Deterministic' || history?.model) {
+      appendExecutionFact(facts, 'Model', history?.model_invoked ? friendlyModel(history.model, history.model_mode) : 'Not used');
+    }
+    const confidence = friendlyConfidence(history?.confidence);
+    if (confidence) appendExecutionFact(facts, 'Confidence', confidence, `confidence-${confidence.toLowerCase()}`);
+    const duration = executionDuration(history);
+    if (duration) appendExecutionFact(facts, duration.label, duration.value);
+    execution.appendChild(facts);
+
+    const targets = Array.isArray(history?.targets) ? history.targets.filter((target) => target?.display_name || target?.canonical_id) : [];
+    if (targets.length) {
+      const targetBlock = makeElement('div', 'execution-targets');
+      targetBlock.appendChild(makeElement('div', 'execution-label', targets.length === 1 ? 'Target' : 'Targets'));
+      const targetList = makeElement('div', 'execution-target-list');
+      for (const target of targets) {
+        const item = makeElement('div', 'execution-target');
+        item.append(
+          makeElement('span', 'execution-target-kind', humanizeIdentifier(target.kind || 'target')),
+          makeElement('span', 'execution-target-name', target.display_name || target.canonical_id),
+        );
+        targetList.appendChild(item);
+      }
+      targetBlock.appendChild(targetList);
+      execution.appendChild(targetBlock);
+    }
+
+    const auditNotes = [];
+    if (history?.request_redacted || history?.result_redacted) auditNotes.push('Audit copy redacted for safety.');
+    if (history?.request_truncated || history?.result_truncated) auditNotes.push('Audit copy truncated to storage limit.');
+    if (auditNotes.length) {
+      const notes = makeElement('div', 'execution-notes');
+      for (const note of auditNotes) notes.appendChild(makeElement('p', '', note));
+      execution.appendChild(notes);
+    }
+    content.appendChild(execution);
+
+    if (reads.length) content.appendChild(renderHistoryEvidence(reads));
+
+    const technical = renderExecutionTechnical(history);
+    if (technical) content.appendChild(technical);
+    details.dataset.loaded = '1';
+  }
+
+  function executionSummary(history, reads) {
+    const parts = ['Details'];
+    const status = friendlyStatus(history?.status);
+    const confidence = friendlyConfidence(history?.confidence);
+    const mode = friendlyMode(history);
+    if (status && status !== 'Completed') parts.push(status);
+    if (confidence) parts.push(`${confidence} confidence`);
+    else if (mode === 'Deterministic') parts.push(mode);
+    else if (!reads.length && history?.model_invoked) parts.push(friendlyModel(history.model));
+    else if (mode && mode !== 'Conversation') parts.push(mode);
+    if (reads.length) parts.push(`${reads.length} source${reads.length === 1 ? '' : 's'}`);
+    return parts.join(' · ');
+  }
+
+  function friendlyStatus(status) {
+    const labels = {
+      running: 'Running', succeeded: 'Completed', failed: 'Failed', canceled: 'Canceled', interrupted: 'Interrupted',
+    };
+    return labels[String(status || '').toLowerCase()] || humanizeIdentifier(status || 'Unknown');
+  }
+
+  function statusClass(status) {
+    const value = String(status || '').toLowerCase();
+    if (value === 'succeeded') return 'status-completed';
+    if (value === 'failed') return 'status-failed';
+    if (value === 'canceled' || value === 'interrupted') return 'status-muted';
+    return '';
+  }
+
+  function friendlyMode(history) {
+    const answerMode = String(history?.answer_mode || '').toLowerCase();
+    if (answerMode === 'deterministic') return 'Deterministic';
+    if (answerMode === 'phase2c' || answerMode === 'agent') return 'Investigation';
+    if (answerMode === 'conversation' || history?.kind === 'conversation') return 'Conversation';
+    if (history?.kind === 'investigation') return 'Investigation';
+    return humanizeIdentifier(answerMode || history?.kind || 'Execution');
+  }
+
+  function friendlyModel(model, modelMode = '') {
+    const value = String(model || '').trim();
+    const match = value.match(/^qwen3:(\d+(?:\.\d+)?b)/i);
+    const name = match ? `Qwen3 ${match[1].toUpperCase()}` : (value || 'Local model');
+    const mode = String(modelMode || '').toLowerCase();
+    if (mode === 'primary') return `${name} · Primary`;
+    if (mode === 'fallback') return `${name} · Fallback`;
+    return name;
+  }
+
+  function friendlyConfidence(confidence) {
+    const value = String(confidence || '').toLowerCase();
+    if (value === 'high') return 'High';
+    if (value === 'medium') return 'Medium';
+    if (value === 'low') return 'Low';
+    return '';
+  }
+
+  function executionDuration(history) {
+    if (positiveNumber(history?.investigation_seconds)) {
+      return { label: 'Investigation', value: formatDuration(Number(history.investigation_seconds)) };
+    }
+    if (positiveNumber(history?.total_seconds)) {
+      return { label: 'Model time', value: formatDuration(Number(history.total_seconds)) };
+    }
+    const started = Date.parse(history?.started_at || '');
+    const completed = Date.parse(history?.completed_at || '');
+    if (Number.isFinite(started) && Number.isFinite(completed) && completed > started) {
+      return { label: 'Elapsed', value: formatDuration((completed - started) / 1000) };
+    }
+    return null;
+  }
+
+  function formatDuration(seconds) {
+    if (seconds >= 60) {
+      let minutes = Math.floor(seconds / 60);
+      let remainder = Math.round(seconds - minutes * 60);
+      if (remainder === 60) { minutes += 1; remainder = 0; }
+      return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`;
+    }
+    const rounded = Math.round(seconds * 10) / 10;
+    return `${rounded}s`;
+  }
+
+  function positiveNumber(value) {
+    return Number.isFinite(Number(value)) && Number(value) > 0;
+  }
+
+  function appendExecutionFact(container, label, value, valueClass = '') {
+    if (!value) return;
+    const fact = makeElement('div', 'execution-fact');
+    fact.append(
+      makeElement('div', 'execution-label', label),
+      makeElement('div', `execution-value${valueClass ? ` ${valueClass}` : ''}`, value),
+    );
+    container.appendChild(fact);
+  }
+
+  function renderHistoryEvidence(reads) {
+    const section = makeElement('section', 'execution-section execution-evidence');
+    section.appendChild(makeElement('h4', 'execution-section-title', 'Evidence'));
+    const followUp = reads.filter((read) => Number(read?.evidence_round) === 2);
+    if (followUp.length) {
+      const firstPass = reads.filter((read) => Number(read?.evidence_round) !== 2);
+      if (firstPass.length) appendEvidenceGroup(section, 'First pass', firstPass);
+      appendEvidenceGroup(section, 'Follow-up', followUp);
+    } else {
+      section.appendChild(renderHistoryEvidenceList(reads));
+    }
+    return section;
+  }
+
+  function appendEvidenceGroup(section, label, reads) {
+    section.appendChild(makeElement('h5', 'execution-evidence-group', label));
+    section.appendChild(renderHistoryEvidenceList(reads));
+  }
+
+  function renderHistoryEvidenceList(reads) {
+    const list = makeElement('div', 'execution-evidence-list');
+    for (const read of reads) {
+      const item = makeElement('div', 'execution-evidence-item');
+      item.appendChild(makeElement('div', 'execution-evidence-name', friendlyCapability(read?.capability)));
+      const body = makeElement('div', 'execution-evidence-body');
+      const context = evidenceContext(read?.arguments);
+      if (context) body.appendChild(makeElement('div', 'execution-evidence-context', context));
+      if (read?.safe_summary) body.appendChild(makeElement('div', 'execution-evidence-summary', read.safe_summary));
+      const readState = evidenceReadState(read);
+      if (readState) body.appendChild(makeElement('div', 'execution-evidence-state', readState));
+      item.appendChild(body);
+      list.appendChild(item);
+    }
+    return list;
+  }
+
+  function friendlyCapability(capability) {
+    const labels = {
+      get_app_context: 'ReactorLab', list_apps: 'Applications', get_platform_overview: 'Platform overview',
+      read_host_history: 'Host history', read_temperature_history: 'Temperature history',
+      read_infrastructure_events: 'Infrastructure events', read_activity: 'Recent activity',
+      read_recovery: 'Restart & recovery', read_service_history: 'Service history',
+      read_application_history: 'Application history', read_deployment_history: 'Deployment history',
+      list_databases: 'Databases', read_database_backups: 'Database backups',
+      list_repository: 'Repository', search_repository: 'Repository search', read_repository_file: 'Repository file',
+      read_runtime_logs: 'Runtime logs', read_deployment_logs: 'Deployment logs',
+    };
+    return labels[capability] || humanizeIdentifier(capability || 'Source');
+  }
+
+  function evidenceContext(args) {
+    if (!args || typeof args !== 'object') return '';
+    const values = [];
+    const push = (value) => {
+      if (['string', 'number', 'boolean'].includes(typeof value) && String(value).trim()) values.push(String(value).trim());
+    };
+    push(args.app);
+    push(args.service);
+    push(args.database_id);
+    push(args.path);
+    push(args.range);
+    if (args.from || args.to) {
+      const from = ['string', 'number'].includes(typeof args.from) ? String(args.from) : '';
+      const to = ['string', 'number'].includes(typeof args.to) ? String(args.to) : '';
+      push(from && to ? `${from} → ${to}` : (from || to));
+    }
+    return [...new Set(values)].join(' · ');
+  }
+
+  function evidenceReadState(read) {
+    const values = [];
+    const status = String(read?.status || '').toLowerCase();
+    const availability = String(read?.availability || '').toLowerCase();
+    if (status && status !== 'completed') values.push(humanizeIdentifier(status));
+    if (availability && availability !== 'available') values.push(humanizeIdentifier(availability));
+    return values.join(' · ');
+  }
+
+  function renderExecutionTechnical(history) {
+    const rows = [];
+    if (history?.route) rows.push(['Route', friendlyRoute(history.route)]);
+    if (Number(history?.evidence_rounds) > 0) rows.push(['Evidence passes', String(history.evidence_rounds)]);
+    if (Number(history?.tool_calls) > 0) rows.push(['Reads', String(history.tool_calls)]);
+    if (Number(history?.second_round_reads) > 0) rows.push(['Follow-up reads', String(history.second_round_reads)]);
+    if (Number(history?.reasoner_calls) > 0) rows.push(['Reasoner calls', String(history.reasoner_calls)]);
+    if (Number(history?.planner_calls) > 0) rows.push(['Planner calls', String(history.planner_calls)]);
+    if (history?.answer_validation) rows.push(['Validation', friendlyValidation(history.answer_validation)]);
+    if (history?.model_invoked && Number(history?.prompt_tokens) > 0) rows.push(['Prompt', `${formatInteger(history.prompt_tokens)} tokens`]);
+    if (history?.model_invoked && Number(history?.generated_tokens) > 0) rows.push(['Generated', `${formatInteger(history.generated_tokens)} tokens`]);
+
+    const links = Array.isArray(history?.links) ? history.links : [];
+    if (!rows.length && !links.length && !history?.links_truncated) return null;
+    const details = document.createElement('details');
+    details.className = 'execution-technical';
+    const summary = document.createElement('summary');
+    summary.textContent = 'Technical';
+    const body = makeElement('div', 'execution-technical-body');
+    if (rows.length) {
+      const grid = makeElement('div', 'execution-technical-grid');
+      for (const [label, value] of rows) appendExecutionFact(grid, label, value);
+      body.appendChild(grid);
+    }
+    if (links.length) {
+      const linkBlock = makeElement('div', 'execution-links');
+      linkBlock.appendChild(makeElement('div', 'execution-label', 'Related executions'));
+      for (const link of links) {
+        linkBlock.appendChild(makeElement('div', 'execution-link', `${friendlyRelation(link?.relation)} related execution`));
+      }
+      body.appendChild(linkBlock);
+    }
+    if (history?.links_truncated) body.appendChild(makeElement('p', 'execution-technical-note', 'Additional links not shown.'));
+    details.append(summary, body);
+    return details;
+  }
+
+  function friendlyValidation(validation) {
+    const labels = {
+      valid: 'Validated', invalid: 'Fallback used (validation failed)', transport_error: 'Model unavailable / transport issue',
+    };
+    return labels[String(validation || '').toLowerCase()] || humanizeIdentifier(validation);
+  }
+
+  function friendlyRoute(route) {
+    const labels = {
+      current_platform_health: 'Platform health', thermal_investigation: 'Thermal investigation',
+      restart_investigation: 'Restart & recovery', restart_recovery_investigation: 'Restart & recovery',
+      application_current: 'Application status', application_current_status: 'Application status',
+      application_performance: 'Application performance', application_performance_investigation: 'Application performance',
+      deployment_correlation: 'Deployment correlation', deployment_correlation_investigation: 'Deployment correlation',
+      database_investigation: 'Database investigation', database_backup_investigation: 'Database investigation',
+      repository_investigation: 'Repository investigation', repository_source_investigation: 'Repository investigation',
+      exact_current_fact: 'Exact current fact',
+    };
+    return labels[route] || humanizeIdentifier(route);
+  }
+
+  function friendlyRelation(relation) {
+    const labels = { undo_of: 'Undo of', recovery_for: 'Recovery for', preview_for: 'Preview for', code_change_for: 'Code change for' };
+    return labels[relation] || humanizeIdentifier(relation || 'Related to');
+  }
+
+  function humanizeIdentifier(value) {
+    const text = String(value || '').replace(/[_-]+/g, ' ').trim();
+    return text ? text.charAt(0).toUpperCase() + text.slice(1) : '';
+  }
+
+  function formatInteger(value) {
+    return new Intl.NumberFormat().format(Math.max(0, Math.round(Number(value) || 0)));
+  }
+
+  function makeElement(tag, className = '', text = '') {
+    const element = document.createElement(tag);
+    if (className) element.className = className;
+    if (text !== '') element.textContent = String(text);
+    return element;
+  }
+
+  function replaceLiveToolsWithStoredDetails(assistant, stored) {
+    if (!assistant?.wrap?.isConnected || stored?.role !== 'assistant') return;
+    const historyId = String(stored.history_entry_id || '').trim();
+    const evidence = Array.isArray(stored.evidence) ? stored.evidence : [];
+    if (historyId) {
+      assistant.wrap.querySelector('.tool-box')?.remove();
+      assistant.wrap.querySelector('.evidence-box')?.remove();
+      assistant.wrap.querySelector('.execution-box')?.remove();
+      assistant.wrap.appendChild(renderExecutionDetails(historyId));
+    } else if (evidence.length) {
+      assistant.wrap.querySelector('.tool-box')?.remove();
+      assistant.wrap.querySelector('.execution-box')?.remove();
+      assistant.wrap.appendChild(renderEvidence(evidence));
+    }
   }
 
   function renderLiveTools(container, events) {
@@ -399,14 +790,16 @@
       }
 
       await loadChats();
-      if (state.currentChatId) {
-        const detail = await api(`/api/v1/chats/${encodeURIComponent(state.currentChatId)}`);
+      if (state.currentChatId === chatId) {
+        const detail = await api(`/api/v1/chats/${encodeURIComponent(chatId)}`);
+        if (state.currentChatId !== chatId) return;
         els.chatTitle.textContent = detail.chat?.title || 'Chat';
-        const stored = detail.messages?.[detail.messages.length - 1];
-        if (stored?.role === 'assistant' && stored.evidence?.length) {
-          assistant.wrap.querySelector('.tool-box')?.remove();
-          assistant.wrap.appendChild(renderEvidence(stored.evidence));
+        const messages = detail.messages || [];
+        let stored = null;
+        for (let index = messages.length - 1; index >= 0; index -= 1) {
+          if (messages[index]?.role === 'assistant') { stored = messages[index]; break; }
         }
+        replaceLiveToolsWithStoredDetails(assistant, stored);
       }
     } catch (err) {
       stopActivity();
