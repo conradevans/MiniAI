@@ -163,14 +163,16 @@ type generateRequest struct {
 }
 
 type generateChunk struct {
-	Response      string `json:"response"`
-	Done          bool   `json:"done"`
-	DoneReason    string `json:"done_reason,omitempty"`
-	EvalCount     int    `json:"eval_count,omitempty"`
-	EvalDuration  int64  `json:"eval_duration,omitempty"`
-	LoadDuration  int64  `json:"load_duration,omitempty"`
-	TotalDuration int64  `json:"total_duration,omitempty"`
-	Error         string `json:"error,omitempty"`
+	Response           string `json:"response"`
+	Done               bool   `json:"done"`
+	DoneReason         string `json:"done_reason,omitempty"`
+	PromptEvalCount    int    `json:"prompt_eval_count,omitempty"`
+	PromptEvalDuration int64  `json:"prompt_eval_duration,omitempty"`
+	EvalCount          int    `json:"eval_count,omitempty"`
+	EvalDuration       int64  `json:"eval_duration,omitempty"`
+	LoadDuration       int64  `json:"load_duration,omitempty"`
+	TotalDuration      int64  `json:"total_duration,omitempty"`
+	Error              string `json:"error,omitempty"`
 }
 
 type versionResponse struct {
@@ -228,6 +230,8 @@ func main() {
 	mux.HandleFunc("GET /api/v1/chats/{id}", a.handleGetChat)
 	mux.HandleFunc("PATCH /api/v1/chats/{id}", a.handleRenameChat)
 	mux.HandleFunc("DELETE /api/v1/chats/{id}", a.handleDeleteChat)
+	mux.HandleFunc("GET /api/v1/history", a.handleListHistory)
+	mux.HandleFunc("GET /api/v1/history/{id}", a.handleGetHistory)
 	mux.HandleFunc("POST /api/v1/session", a.handleCreateSession)
 	mux.HandleFunc("POST /api/v1/session/{id}/heartbeat", a.handleHeartbeat)
 	mux.HandleFunc("DELETE /api/v1/session/{id}", a.handleDeleteSession)
@@ -471,7 +475,6 @@ func (a *app) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	defer a.finishChat(req.SessionID)
 
 	var history []storedMessage
-	var capture *sseCaptureWriter
 	if req.ChatID != "" {
 		exists, err := a.store.chatExists(req.ChatID)
 		if err != nil {
@@ -487,20 +490,19 @@ func (a *app) handleChatStream(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "could not load chat history")
 			return
 		}
-		if _, err := a.store.appendUserMessage(req.ChatID, req.Message); err != nil {
-			writeError(w, http.StatusInternalServerError, "could not persist user message")
-			return
-		}
-		capture = newSSECaptureWriter(w)
-		w = capture
-		defer func() {
-			if capture.done && strings.TrimSpace(capture.answer.String()) != "" {
-				if _, err := a.store.appendAssistantMessage(req.ChatID, capture.answer.String(), capture.evidence); err != nil {
-					log.Printf("persist MiniAI assistant message: %v", err)
-				}
-			}
-		}()
 	}
+	if a.store == nil {
+		writeError(w, http.StatusServiceUnavailable, "execution history is unavailable")
+		return
+	}
+	historyEntry, _, err := a.store.startHistoryEntry(req.ChatID, req.Message, time.Now().UTC())
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "could not create execution history")
+		return
+	}
+	capture := newSSECaptureWriter(w)
+	w = capture
+	defer a.finalizeRequestHistory(r.Context(), historyEntry, capture)
 
 	if isSimpleRepositoryLocationQuestion(req.Message) {
 		if a.handleConversationRepositoryLookup(w, r, req.Message, history) {
@@ -594,9 +596,8 @@ func (a *app) handleSelectedModelChatStream(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("X-Accel-Buffering", "no")
 
 	sendSSE(w, "meta", a.withInferenceProfileMetadata(policy.Model, map[string]any{
-		"model":        policy.Model,
-		"mode":         policy.Mode,
-		"context_apps": contextApps,
+		"model": policy.Model, "mode": policy.Mode, "context_apps": contextApps,
+		"answer_mode": "conversation", "model_invoked": true, "planner_calls": 0, "reasoner_calls": 0,
 	}))
 	flusher.Flush()
 
@@ -667,9 +668,12 @@ func (a *app) handleSelectedModelChatStream(w http.ResponseWriter, r *http.Reque
 		tps = float64(final.EvalCount) / (float64(final.EvalDuration) / 1e9)
 	}
 	sendSSE(w, "done", map[string]any{
-		"model":             policy.Model,
-		"mode":              policy.Mode,
+		"model": policy.Model, "mode": policy.Mode, "answer_mode": "conversation", "model_invoked": true,
+		"planner_calls": 0, "reasoner_calls": 0,
+		"prompt_tokens":     final.PromptEvalCount,
+		"prompt_seconds":    round2(float64(final.PromptEvalDuration) / 1e9),
 		"tokens":            final.EvalCount,
+		"generated_tokens":  final.EvalCount,
 		"tokens_per_second": round2(tps),
 		"load_seconds":      round2(float64(final.LoadDuration) / 1e9),
 		"total_seconds":     round2(float64(final.TotalDuration) / 1e9),

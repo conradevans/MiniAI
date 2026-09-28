@@ -16,20 +16,25 @@ type createChatRequest struct {
 
 type sseCaptureWriter struct {
 	http.ResponseWriter
-	flusher  http.Flusher
-	buffer   bytes.Buffer
-	answer   strings.Builder
-	evidence []evidence
-	pending  []pendingEvidence
-	done     bool
+	flusher     http.Flusher
+	buffer      bytes.Buffer
+	answer      strings.Builder
+	evidence    []evidence
+	pending     []pendingEvidence
+	metadata    HistoryExecutionMetadata
+	done        bool
+	streamError bool
+	statusCode  int
 }
 
 type pendingEvidence struct {
-	RequestID string
-	Name      string
-	Arguments map[string]any
-	Summary   string
-	Completed bool
+	RequestID    string
+	Name         string
+	Arguments    map[string]any
+	Summary      string
+	Completed    bool
+	Status       string
+	Availability string
 }
 
 func newSSECaptureWriter(w http.ResponseWriter) *sseCaptureWriter {
@@ -38,12 +43,22 @@ func newSSECaptureWriter(w http.ResponseWriter) *sseCaptureWriter {
 }
 
 func (w *sseCaptureWriter) Write(p []byte) (int, error) {
+	if w.statusCode == 0 {
+		w.statusCode = http.StatusOK
+	}
 	n, err := w.ResponseWriter.Write(p)
 	if n > 0 {
 		_, _ = w.buffer.Write(p[:n])
 		w.consume()
 	}
 	return n, err
+}
+
+func (w *sseCaptureWriter) WriteHeader(statusCode int) {
+	if w.statusCode == 0 {
+		w.statusCode = statusCode
+	}
+	w.ResponseWriter.WriteHeader(statusCode)
 }
 
 func (w *sseCaptureWriter) Flush() {
@@ -90,8 +105,16 @@ func (w *sseCaptureWriter) consumeBlock(block string) {
 		}
 	case "tool":
 		w.captureTool(obj)
+	case "meta":
+		w.metadata.mergeSSE(obj)
 	case "done":
+		w.metadata.mergeSSE(obj)
 		w.done = true
+	case "error":
+		w.streamError = true
+		if w.metadata.ErrorCategory == "" {
+			w.metadata.ErrorCategory = "stream_error"
+		}
 	}
 }
 
@@ -106,7 +129,10 @@ func (w *sseCaptureWriter) captureTool(obj map[string]any) {
 	case "start":
 		args, _ := obj["arguments"].(map[string]any)
 		summary, _ := obj["summary"].(string)
-		w.pending = append(w.pending, pendingEvidence{RequestID: requestID, Name: name, Arguments: args, Summary: summary})
+		w.pending = append(w.pending, pendingEvidence{
+			RequestID: requestID, Name: name, Arguments: sanitizeHistoryArguments(args), Summary: summary,
+			Status: "running",
+		})
 	case "result":
 		summary, _ := obj["summary"].(string)
 		resultArgs, _ := obj["arguments"].(map[string]any)
@@ -123,6 +149,7 @@ func (w *sseCaptureWriter) captureTool(obj map[string]any) {
 				continue
 			}
 			pending.Completed = true
+			pending.Status = "completed"
 			if len(resultArgs) > 0 {
 				if pending.Arguments == nil {
 					pending.Arguments = map[string]any{}
@@ -133,6 +160,10 @@ func (w *sseCaptureWriter) captureTool(obj map[string]any) {
 			}
 			if summary == "" {
 				summary = pending.Summary
+			}
+			pending.Summary = summary
+			if availability, _ := obj["availability"].(string); availability != "" {
+				pending.Availability = availability
 			}
 			appName, _ := pending.Arguments["app"].(string)
 			path, _ := pending.Arguments["path"].(string)
@@ -147,6 +178,123 @@ func (w *sseCaptureWriter) captureTool(obj map[string]any) {
 			return
 		}
 	}
+}
+
+func (metadata *HistoryExecutionMetadata) mergeSSE(object map[string]any) {
+	mergeString := func(key string, target *string) {
+		if value, ok := object[key].(string); ok {
+			*target = value
+		}
+	}
+	mergeInt := func(key string, target *int) {
+		if value, ok := historyJSONInt(object[key]); ok {
+			*target = value
+		}
+	}
+	mergeFloat := func(key string, target *float64) {
+		if value, ok := historyJSONFloat(object[key]); ok {
+			*target = value
+		}
+	}
+	mergeString("answer_mode", &metadata.AnswerMode)
+	mergeString("route", &metadata.Route)
+	mergeString("model", &metadata.Model)
+	mergeString("mode", &metadata.ModelMode)
+	mergeString("inference_profile", &metadata.InferenceProfile)
+	mergeString("confidence", &metadata.Confidence)
+	if metadata.Confidence == "" {
+		mergeString("diagnostic_confidence", &metadata.Confidence)
+	}
+	mergeString("answer_validation", &metadata.AnswerValidation)
+	if metadata.AnswerValidation == "transport_error" {
+		metadata.ErrorCategory = "transport_error"
+	}
+	mergeString("error_category", &metadata.ErrorCategory)
+	if limitation, ok := object["limitation"].(string); ok && limitation != "unsupported_local_evidence" {
+		metadata.ErrorCategory = limitation
+	}
+	if value, ok := object["model_invoked"].(bool); ok {
+		metadata.ModelInvoked = value
+	}
+	mergeInt("planner_calls", &metadata.PlannerCalls)
+	mergeInt("reasoner_calls", &metadata.ReasonerCalls)
+	mergeInt("evidence_rounds", &metadata.EvidenceRounds)
+	if metadata.EvidenceRounds == 0 {
+		mergeInt("investigation_rounds", &metadata.EvidenceRounds)
+	}
+	mergeInt("second_round_reads", &metadata.SecondRoundReads)
+	mergeInt("tool_calls", &metadata.ToolCalls)
+	mergeInt("evidence_packet_bytes", &metadata.EvidencePacketBytes)
+	mergeInt("prompt_tokens", &metadata.PromptTokens)
+	if _, exists := object["generated_tokens"]; exists {
+		mergeInt("generated_tokens", &metadata.GeneratedTokens)
+	} else {
+		mergeInt("tokens", &metadata.GeneratedTokens)
+	}
+	mergeFloat("load_seconds", &metadata.LoadSeconds)
+	mergeFloat("prompt_seconds", &metadata.PromptSeconds)
+	mergeFloat("total_seconds", &metadata.TotalSeconds)
+	if _, exists := object["investigation_seconds"]; exists {
+		mergeFloat("investigation_seconds", &metadata.InvestigationSeconds)
+	} else {
+		mergeFloat("agent_seconds", &metadata.InvestigationSeconds)
+	}
+}
+
+func historyJSONInt(value any) (int, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return int(typed), true
+	case int:
+		return typed, true
+	case json.Number:
+		parsed, err := typed.Int64()
+		return int(parsed), err == nil
+	default:
+		return 0, false
+	}
+}
+
+func historyJSONFloat(value any) (float64, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return typed, true
+	case int:
+		return float64(typed), true
+	case json.Number:
+		parsed, err := typed.Float64()
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func (w *sseCaptureWriter) capturedHistoryReads(finalStatus HistoryStatus) []HistoryEvidenceRead {
+	secondRoundStart := len(w.pending) - w.metadata.SecondRoundReads
+	if secondRoundStart < 0 {
+		secondRoundStart = len(w.pending)
+	}
+	reads := make([]HistoryEvidenceRead, 0, len(w.pending))
+	for index, pending := range w.pending {
+		round := 1
+		if w.metadata.EvidenceRounds >= 2 && index >= secondRoundStart {
+			round = 2
+		}
+		status := pending.Status
+		if !pending.Completed {
+			if finalStatus == HistoryStatusCanceled {
+				status = "canceled"
+			} else {
+				status = "failed"
+			}
+		}
+		reads = append(reads, HistoryEvidenceRead{
+			RequestID: pending.RequestID, EvidenceRound: round, Order: index, Capability: pending.Name,
+			Arguments: pending.Arguments, SafeSummary: pending.Summary, Status: status,
+			Availability: pending.Availability,
+		})
+	}
+	return reads
 }
 
 func (a *app) handleListChats(w http.ResponseWriter, r *http.Request) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,7 @@ const (
 	chatHistoryMaxMessages = 12
 	chatHistoryMaxRunes    = 6000
 	chatTitleMaxRunes      = 72
+	miniAISchemaVersion    = 1
 )
 
 var errChatNotFound = errors.New("chat not found")
@@ -33,12 +35,13 @@ type chatRecord struct {
 }
 
 type storedMessage struct {
-	ID        int64      `json:"id"`
-	ChatID    string     `json:"chat_id,omitempty"`
-	Role      string     `json:"role"`
-	Content   string     `json:"content"`
-	CreatedAt time.Time  `json:"created_at"`
-	Evidence  []evidence `json:"evidence,omitempty"`
+	ID             int64      `json:"id"`
+	ChatID         string     `json:"chat_id,omitempty"`
+	HistoryEntryID string     `json:"history_entry_id,omitempty"`
+	Role           string     `json:"role"`
+	Content        string     `json:"content"`
+	CreatedAt      time.Time  `json:"created_at"`
+	Evidence       []evidence `json:"evidence,omitempty"`
 }
 
 type evidence struct {
@@ -70,7 +73,8 @@ func openChatStore(path string) (*chatStore, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return nil, fmt.Errorf("create chat database directory: %w", err)
 	}
-	db, err := sql.Open("sqlite", path)
+	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: "_foreign_keys=on"}).String()
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open chat database: %w", err)
 	}
@@ -90,6 +94,32 @@ func (s *chatStore) initialize() error {
 		`PRAGMA journal_mode = WAL`,
 		`PRAGMA synchronous = NORMAL`,
 		`PRAGMA busy_timeout = 5000`,
+	} {
+		if _, err := s.db.Exec(statement); err != nil {
+			return fmt.Errorf("configure chat database: %w", err)
+		}
+	}
+	var foreignKeys int
+	if err := s.db.QueryRow(`PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil {
+		return fmt.Errorf("verify chat database foreign keys: %w", err)
+	}
+	if foreignKeys != 1 {
+		return errors.New("verify chat database foreign keys: enforcement is disabled")
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin chat database migration: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var version int
+	if err := tx.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		return fmt.Errorf("read chat database schema version: %w", err)
+	}
+	if version > miniAISchemaVersion {
+		return fmt.Errorf("chat database schema version %d is newer than supported version %d", version, miniAISchemaVersion)
+	}
+	for _, statement := range []string{
 		`CREATE TABLE IF NOT EXISTS chats (
 			id TEXT PRIMARY KEY,
 			title TEXT NOT NULL,
@@ -118,10 +148,104 @@ func (s *chatStore) initialize() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS evidence_message_idx
 		 ON evidence(message_id, id)`,
+		`CREATE TABLE IF NOT EXISTS history_entries (
+			id TEXT PRIMARY KEY,
+			kind TEXT NOT NULL CHECK(kind IN ('conversation','investigation','action','code_change','preview')),
+			status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed','canceled','interrupted')),
+			chat_id TEXT REFERENCES chats(id) ON DELETE SET NULL,
+			user_message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+			assistant_message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+			request_text TEXT NOT NULL,
+			request_redacted INTEGER NOT NULL DEFAULT 0,
+			request_truncated INTEGER NOT NULL DEFAULT 0,
+			result_text TEXT NOT NULL DEFAULT '',
+			result_redacted INTEGER NOT NULL DEFAULT 0,
+			result_truncated INTEGER NOT NULL DEFAULT 0,
+			started_at TEXT NOT NULL,
+			completed_at TEXT,
+			answer_mode TEXT NOT NULL DEFAULT '',
+			route TEXT NOT NULL DEFAULT '',
+			model TEXT NOT NULL DEFAULT '',
+			model_mode TEXT NOT NULL DEFAULT '',
+			inference_profile TEXT NOT NULL DEFAULT '',
+			confidence TEXT NOT NULL DEFAULT '',
+			model_invoked INTEGER NOT NULL DEFAULT 0,
+			planner_calls INTEGER NOT NULL DEFAULT 0,
+			reasoner_calls INTEGER NOT NULL DEFAULT 0,
+			evidence_rounds INTEGER NOT NULL DEFAULT 0,
+			second_round_reads INTEGER NOT NULL DEFAULT 0,
+			tool_calls INTEGER NOT NULL DEFAULT 0,
+			evidence_packet_bytes INTEGER NOT NULL DEFAULT 0,
+			answer_validation TEXT NOT NULL DEFAULT '',
+			prompt_tokens INTEGER NOT NULL DEFAULT 0,
+			generated_tokens INTEGER NOT NULL DEFAULT 0,
+			load_seconds REAL NOT NULL DEFAULT 0,
+			prompt_seconds REAL NOT NULL DEFAULT 0,
+			total_seconds REAL NOT NULL DEFAULT 0,
+			investigation_seconds REAL NOT NULL DEFAULT 0,
+			error_category TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS history_entries_started_idx
+		 ON history_entries(started_at DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS history_entries_chat_idx
+		 ON history_entries(chat_id, started_at DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS history_entries_kind_idx
+		 ON history_entries(kind, started_at DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS history_entries_status_idx
+		 ON history_entries(status, started_at DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS history_entries_route_idx
+		 ON history_entries(route, started_at DESC, id DESC)`,
+		`CREATE TABLE IF NOT EXISTS history_targets (
+			history_entry_id TEXT NOT NULL REFERENCES history_entries(id) ON DELETE CASCADE,
+			ordinal INTEGER NOT NULL,
+			kind TEXT NOT NULL,
+			canonical_id TEXT NOT NULL,
+			display_name TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY(history_entry_id, ordinal)
+		)`,
+		`CREATE INDEX IF NOT EXISTS history_targets_lookup_idx
+		 ON history_targets(kind, canonical_id, history_entry_id)`,
+		`CREATE TABLE IF NOT EXISTS history_evidence_reads (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			history_entry_id TEXT NOT NULL REFERENCES history_entries(id) ON DELETE CASCADE,
+			request_id TEXT NOT NULL DEFAULT '',
+			evidence_round INTEGER NOT NULL,
+			read_order INTEGER NOT NULL,
+			capability TEXT NOT NULL,
+			arguments_json TEXT NOT NULL DEFAULT '{}',
+			safe_summary TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT '',
+			availability TEXT NOT NULL DEFAULT '',
+			started_at TEXT,
+			completed_at TEXT
+		)`,
+		`CREATE INDEX IF NOT EXISTS history_evidence_reads_entry_idx
+		 ON history_evidence_reads(history_entry_id, evidence_round, read_order, id)`,
+		`CREATE TABLE IF NOT EXISTS history_links (
+			from_entry_id TEXT NOT NULL REFERENCES history_entries(id) ON DELETE RESTRICT,
+			to_entry_id TEXT NOT NULL REFERENCES history_entries(id) ON DELETE RESTRICT,
+			relation TEXT NOT NULL CHECK(relation IN ('undo_of','recovery_for','preview_for','code_change_for')),
+			created_at TEXT NOT NULL,
+			PRIMARY KEY(from_entry_id, to_entry_id, relation)
+		)`,
+		`CREATE INDEX IF NOT EXISTS history_links_to_idx
+		 ON history_links(to_entry_id, relation, from_entry_id)`,
 	} {
-		if _, err := s.db.Exec(statement); err != nil {
-			return fmt.Errorf("initialize chat database: %w", err)
+		if _, err := tx.Exec(statement); err != nil {
+			return fmt.Errorf("migrate chat database: %w", err)
 		}
+	}
+	if err := validateMiniAISchemaV1(tx); err != nil {
+		return fmt.Errorf("validate chat database schema version 1: %w", err)
+	}
+	if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, miniAISchemaVersion)); err != nil {
+		return fmt.Errorf("set chat database schema version: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit chat database migration: %w", err)
+	}
+	if _, err := s.interruptRunningHistory(time.Now().UTC()); err != nil {
+		return fmt.Errorf("recover interrupted execution history: %w", err)
 	}
 	return nil
 }
@@ -235,6 +359,13 @@ func (s *chatStore) getChat(id string) (chatDetail, error) {
 			return chatDetail{}, err
 		}
 	}
+	links, err := s.chatMessageHistoryLinks(id)
+	if err != nil {
+		return chatDetail{}, err
+	}
+	for i := range out.Messages {
+		out.Messages[i].HistoryEntryID = links[out.Messages[i].ID]
+	}
 	return out, nil
 }
 
@@ -317,19 +448,30 @@ func (s *chatStore) appendAssistantMessage(chatID, content string, items []evide
 }
 
 func (s *chatStore) appendMessage(chatID, role, content string, items []evidence) (storedMessage, error) {
-	content = strings.TrimSpace(content)
-	if content == "" {
-		return storedMessage{}, fmt.Errorf("message content is required")
-	}
 	now := time.Now().UTC()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return storedMessage{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	message, err := appendMessageTx(tx, chatID, role, content, items, now)
+	if err != nil {
+		return storedMessage{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return storedMessage{}, err
+	}
+	return message, nil
+}
+
+func appendMessageTx(tx *sql.Tx, chatID, role, content string, items []evidence, now time.Time) (storedMessage, error) {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return storedMessage{}, fmt.Errorf("message content is required")
+	}
 
 	var title string
-	err = tx.QueryRow(`SELECT title FROM chats WHERE id = ?`, chatID).Scan(&title)
+	err := tx.QueryRow(`SELECT title FROM chats WHERE id = ?`, chatID).Scan(&title)
 	if errors.Is(err, sql.ErrNoRows) {
 		return storedMessage{}, errChatNotFound
 	}
@@ -378,9 +520,6 @@ func (s *chatStore) appendMessage(chatID, role, content string, items []evidence
 			item.CreatedAt = now
 			cleanEvidence = append(cleanEvidence, item)
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return storedMessage{}, err
 	}
 	return storedMessage{ID: messageID, ChatID: chatID, Role: role, Content: content, CreatedAt: now, Evidence: cleanEvidence}, nil
 }

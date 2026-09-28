@@ -55,12 +55,17 @@ type phase2CTestHarness struct {
 	responseContent  string
 	responseStatus   int
 	responseBuilder  func(chatAPIRequest) string
+	onGenerate       func(*http.Request)
 	onReasoner       func(*http.Request)
 	onReasonerFinish func()
 }
 
 func newPhase2CTestHarness(t *testing.T, availableGiB float64) *phase2CTestHarness {
 	t.Helper()
+	store, err := openChatStore(t.TempDir() + "/miniai.db")
+	if err != nil {
+		t.Fatal(err)
+	}
 	h := &phase2CTestHarness{
 		executor: &unavailablePhase2Executor{}, runner: &fakePowerHelperRunner{},
 		reactorPaths: map[string]int{}, deploymentPort: 8080,
@@ -99,7 +104,14 @@ func newPhase2CTestHarness(t *testing.T, availableGiB float64) *phase2CTestHarne
 			}
 			h.mu.Lock()
 			h.generateRequests = append(h.generateRequests, request)
+			hook := h.onGenerate
 			h.mu.Unlock()
+			if hook != nil {
+				hook(r)
+			}
+			if r.Context().Err() != nil {
+				return
+			}
 			_ = json.NewEncoder(w).Encode(generateChunk{
 				Response: "Direct response.", Done: true, EvalCount: 4, EvalDuration: int64(time.Second),
 			})
@@ -167,12 +179,13 @@ func newPhase2CTestHarness(t *testing.T, availableGiB float64) *phase2CTestHarne
 	}))
 	h.app = &app{
 		reactorURL: h.reactor.URL, ollamaURL: h.ollama.URL, repoRoot: t.TempDir(), client: http.DefaultClient,
+		store:             store,
 		powerLeaseManager: newCPUPowerLeaseManager(h.runner, nil), phase2Executor: h.executor,
 		phase2Now:          func() time.Time { return time.Date(2026, 9, 25, 18, 0, 0, 0, time.UTC) },
 		systemStatusReader: func() (systemStatus, error) { return systemStatus{AvailableMemoryGiB: availableGiB, Load1: 1}, nil },
 		ollamaStatusReader: func(context.Context) ollamaStatus { return ollamaStatus{Reachable: true} },
 	}
-	t.Cleanup(func() { h.ollama.Close(); h.reactor.Close() })
+	t.Cleanup(func() { _ = store.Close(); h.ollama.Close(); h.reactor.Close() })
 	return h
 }
 

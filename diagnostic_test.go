@@ -25,6 +25,10 @@ func diagnosticResponseJSON(t *testing.T, response diagnosticFinalResponse) stri
 
 func newDiagnosticTestApp(t *testing.T, deployments []any, services []any, runtimeLogs, deploymentLogs string) (*app, func()) {
 	t.Helper()
+	store, err := openChatStore(t.TempDir() + "/miniai.db")
+	if err != nil {
+		t.Fatal(err)
+	}
 	reactor := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/deployments":
@@ -77,12 +81,13 @@ func newDiagnosticTestApp(t *testing.T, deployments []any, services []any, runti
 		}
 	}))
 	cleanup := func() {
+		_ = store.Close()
 		mini.Close()
 		reactor.Close()
 	}
 	return &app{
 		reactorURL: reactor.URL, minideployURL: mini.URL,
-		repoRoot: t.TempDir(), client: http.DefaultClient,
+		repoRoot: t.TempDir(), client: http.DefaultClient, store: store,
 	}, cleanup
 }
 

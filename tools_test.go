@@ -56,6 +56,30 @@ func TestReadRepositoryFileRedactsSecretAssignments(t *testing.T) {
 	}
 }
 
+func TestSharedSanitizerRetainsPrePhase3Behavior(t *testing.T) {
+	input := strings.Join([]string{
+		"Bearer SHARED_TOKEN",
+		"-----BEGIN PRIVATE KEY-----\nSHARED_PRIVATE_MATERIAL\n-----END PRIVATE KEY-----",
+		"Authorization: Bearer HEADER_TOKEN",
+		"password=PASSWORD_VALUE",
+		"https://gituser:GIT_PASSWORD@example.test/repository.git",
+	}, "\n")
+	got, redacted := scrubSensitiveText(input)
+	if !redacted {
+		t.Fatal("shared sanitizer did not report its pre-existing redactions")
+	}
+	for _, retained := range []string{"Bearer SHARED_TOKEN", "SHARED_PRIVATE_MATERIAL"} {
+		if !strings.Contains(got, retained) {
+			t.Fatalf("shared sanitizer changed pre-Phase-3 behavior for %q: %q", retained, got)
+		}
+	}
+	for _, removed := range []string{"HEADER_TOKEN", "PASSWORD_VALUE", "GIT_PASSWORD"} {
+		if strings.Contains(got, removed) {
+			t.Fatalf("shared sanitizer failed existing redaction for %q: %q", removed, got)
+		}
+	}
+}
+
 func TestSearchRepositorySkipsBlockedDirectories(t *testing.T) {
 	_, a := makeToolRepo(t)
 	got, err := a.searchRepository(context.Background(), "myscheduler", ".", "schedule")
