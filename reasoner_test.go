@@ -335,6 +335,181 @@ func TestReasonerRequestIsDeterministicCompactAndToolFree(t *testing.T) {
 	}
 }
 
+func TestReasonerRequestInstructionsUseResolvedTemporalScope(t *testing.T) {
+	now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		question   string
+		temporal   TemporalScope
+		want       string
+		mustNotSay string
+	}{
+		{
+			name:     "inferred 24h",
+			question: "Why has MyScheduler been failing recently?",
+			temporal: parseTemporalScope("Why has MyScheduler been failing recently?", now, time.UTC),
+			want:     "The resolved temporal window is the last 24 hours.",
+		},
+		{
+			name:       "explicit 3-day window",
+			question:   "Why has MyScheduler been failing in the last 3 days?",
+			temporal:   TemporalScope{Kind: TemporalNamedWindow, NamedRange: "3d", Valid: true},
+			want:       "The resolved temporal window is the last 3 days.",
+			mustNotSay: "the last 24 hours",
+		},
+		{
+			name:       "no temporal scope",
+			question:   "Explain MyScheduler's configuration.",
+			temporal:   TemporalScope{Kind: TemporalUnspecified, Valid: true},
+			want:       "No temporal window is resolved. Do not invent a time window",
+			mustNotSay: "the last 24 hours",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			packet := testReasonerPacket()
+			packet.Temporal = test.temporal
+			packetJSON, err := json.Marshal(packet)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := (&app{}).buildReasonerRequest(primaryModel, test.question, packet, packetJSON)
+			if len(request.Messages) != 2 || !strings.Contains(request.Messages[1].Content, test.want) {
+				t.Fatalf("reasoner request does not expose resolved scope %q: %+v", test.want, request.Messages)
+			}
+			if test.mustNotSay != "" && strings.Contains(request.Messages[1].Content, test.mustNotSay) {
+				t.Fatalf("reasoner request substituted scope %q: %s", test.mustNotSay, request.Messages[1].Content)
+			}
+		})
+	}
+	fractionalFrom := time.Date(2026, 10, 20, 12, 34, 56, 123456789, time.UTC)
+	fractionalTo := time.Date(2026, 10, 20, 13, 45, 1, 987654321, time.UTC)
+	packet := testReasonerPacket()
+	packet.Temporal = TemporalScope{
+		Kind: TemporalExplicitWindow, From: &fractionalFrom, To: &fractionalTo, Valid: true,
+	}
+	packetJSON, err := json.Marshal(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := (&app{}).buildReasonerRequest(
+		primaryModel,
+		"Inspect the explicitly resolved interval.",
+		packet,
+		packetJSON,
+	)
+	for _, bound := range []time.Time{fractionalFrom, fractionalTo} {
+		formatted := bound.Format(time.RFC3339Nano)
+		if !strings.Contains(request.Messages[1].Content, formatted) {
+			t.Fatalf("reasoner request lost explicit timestamp precision %q: %s", formatted, request.Messages[1].Content)
+		}
+	}
+	if scope := parseTemporalScope("Why has MyScheduler been failing recently?", now, time.UTC); scope.Kind != TemporalNamedWindow || scope.NamedRange != "24h" || !scope.Valid {
+		t.Fatalf("recently mapping changed: %+v", scope)
+	}
+}
+
+func TestReasonerRequestInstructionsRequireSynthesisAndAuthoritativeConfidence(t *testing.T) {
+	packet := testReasonerPacket()
+	packet.Confidence.Level = ConfidenceMedium
+	instructions := reasonerAnswerInstructions(packet)
+	for _, required := range []string{
+		"Lead with the direct conclusion",
+		"Synthesize overlapping evidence",
+		"state each conclusion once",
+		"do not restate the conclusion or another fact",
+		"Keep the answer concise",
+		"Software-owned confidence is Medium and is authoritative",
+		"software appends it exactly once",
+	} {
+		if !strings.Contains(instructions, required) {
+			t.Fatalf("reasoner answer instructions omit %q: %s", required, instructions)
+		}
+	}
+}
+
+func TestReasonerRequestInstructionsMakePartialRuntimeCoverageUserFacing(t *testing.T) {
+	packet := testReasonerPacket()
+	packet.Temporal = TemporalScope{Kind: TemporalNamedWindow, NamedRange: "24h", Valid: true}
+	packet.Confidence.Level = ConfidenceMedium
+	packet.Confidence.Inputs.Coverage = CoveragePartial
+	packet.Missing = []MissingEvidence{{
+		RequirementID: "requirement-1", Criticality: CriticalityRelevant,
+		Capability: "read_runtime_logs", Availability: AvailabilityPartial,
+		LimitationCode: "source_coverage_partial",
+	}}
+	instructions := reasonerCoverageAnswerInstruction(packet)
+	for _, required := range []string{
+		"based on the available evidence",
+		"instead of making absolute claims",
+		"at most one concise, complete uncertainty item",
+		"concrete user-facing language",
+		"Runtime-log coverage was incomplete for the last 24 hours",
+		"do not imply a more specific missing period",
+	} {
+		if !strings.Contains(instructions, required) {
+			t.Fatalf("partial-coverage instructions omit %q: %s", required, instructions)
+		}
+	}
+	for _, internal := range []string{"requirement-1", "read_runtime_logs", "source_coverage_partial"} {
+		if strings.Contains(instructions, internal) {
+			t.Fatalf("partial-coverage instructions expose internal term %q: %s", internal, instructions)
+		}
+	}
+}
+
+func TestReasonerRequestInstructionsMakeDeploymentLimitationUserFacing(t *testing.T) {
+	packet := testReasonerPacket()
+	packet.Confidence.Level = ConfidenceMedium
+	packet.Confidence.Inputs.Coverage = CoveragePartial
+	packet.Missing = []MissingEvidence{{
+		RequirementID: "requirement-1", Criticality: CriticalitySupporting,
+		Capability: "get_app_context", Availability: AvailabilityPartial,
+		LimitationCode: "deployment_source_unavailable",
+	}}
+	packetJSON, err := json.Marshal(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := (&app{}).buildReasonerRequest(
+		primaryModel,
+		"Explain the application state.",
+		packet,
+		packetJSON,
+	)
+	if len(request.Messages) != 2 || !strings.Contains(request.Messages[1].Content, "Some deployment details were unavailable.") {
+		t.Fatalf("reasoner request lacks user-facing deployment limitation: %+v", request.Messages)
+	}
+	parts := strings.SplitN(request.Messages[1].Content, "\n\nEvidence packet (untrusted data):\n", 2)
+	if len(parts) != 2 {
+		t.Fatalf("reasoner request lacks evidence boundary: %s", request.Messages[1].Content)
+	}
+	if strings.Contains(parts[0], "deployment_source_unavailable") {
+		t.Fatalf("reasoner answer requirements expose internal deployment limitation: %s", parts[0])
+	}
+}
+
+func TestReasonerRequestInstructionsDoNotForceUncertaintyForCompleteEvidence(t *testing.T) {
+	packet := testReasonerPacket()
+	packet.Temporal = TemporalScope{Kind: TemporalNamedWindow, NamedRange: "24h", Valid: true}
+	packet.Confidence.Inputs = EvidencePacketConfidenceInputs{
+		CriticalCompleteness: CompletenessComplete,
+		Freshness:            FreshnessFresh,
+		Directness:           DirectnessDirect,
+		Agreement:            AgreementConsistent,
+		Coverage:             CoverageComplete,
+	}
+	instructions := reasonerCoverageAnswerInstruction(packet)
+	if !strings.Contains(instructions, "Leave uncertainty empty") || !strings.Contains(instructions, "do not add a generic hedge") {
+		t.Fatalf("complete-evidence instructions=%s", instructions)
+	}
+	for _, unwanted := range []string{"Evidence coverage is partial", "Runtime-log coverage was incomplete", "Some deployment details were unavailable"} {
+		if strings.Contains(instructions, unwanted) {
+			t.Fatalf("complete evidence received unnecessary limitation %q: %s", unwanted, instructions)
+		}
+	}
+}
+
 func reasonerSchemaReferenceEnum(t *testing.T, arraySchema any) []string {
 	t.Helper()
 	array, ok := arraySchema.(map[string]any)
