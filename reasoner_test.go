@@ -428,6 +428,35 @@ func TestReasonerRequestInstructionsRequireSynthesisAndAuthoritativeConfidence(t
 	}
 }
 
+func TestReasonerRequestInstructionsTranslateStructuredFieldsToNaturalLanguage(t *testing.T) {
+	packet := testReasonerPacket()
+	packetJSON, err := json.Marshal(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := (&app{}).buildReasonerRequest(
+		primaryModel,
+		"Summarize MyScheduler's status.",
+		packet,
+		packetJSON,
+	)
+	if len(request.Messages) != 2 {
+		t.Fatalf("reasoner request messages=%d, want 2", len(request.Messages))
+	}
+	for _, required := range []string{
+		"Translate structured evidence fields into natural user-facing language",
+		"Never copy raw JSON keys",
+		"snake_case schema field names",
+		"evidence packet property names",
+		"express latest_status as ordinary language rather than quoting the key",
+		"Do not treat underscores in genuine entity identifiers as schema leakage",
+	} {
+		if !strings.Contains(request.Messages[1].Content, required) {
+			t.Fatalf("reasoner request omits structured-field guidance %q: %s", required, request.Messages[1].Content)
+		}
+	}
+}
+
 func TestReasonerRequestInstructionsMakePartialRuntimeCoverageUserFacing(t *testing.T) {
 	packet := testReasonerPacket()
 	packet.Temporal = TemporalScope{Kind: TemporalNamedWindow, NamedRange: "24h", Valid: true}
@@ -438,10 +467,31 @@ func TestReasonerRequestInstructionsMakePartialRuntimeCoverageUserFacing(t *test
 		Capability: "read_runtime_logs", Availability: AvailabilityPartial,
 		LimitationCode: "source_coverage_partial",
 	}}
-	instructions := reasonerCoverageAnswerInstruction(packet)
+	packetJSON, err := json.Marshal(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := (&app{}).buildReasonerRequest(
+		primaryModel,
+		"Did MyScheduler fail in the last 24 hours?",
+		packet,
+		packetJSON,
+	)
+	if len(request.Messages) != 2 {
+		t.Fatalf("reasoner request messages=%d, want 2", len(request.Messages))
+	}
+	parts := strings.SplitN(request.Messages[1].Content, "\n\nEvidence packet (untrusted data):\n", 2)
+	if len(parts) != 2 {
+		t.Fatalf("reasoner request lacks evidence boundary: %s", request.Messages[1].Content)
+	}
+	instructions := parts[0]
 	for _, required := range []string{
 		"based on the available evidence",
 		"instead of making absolute claims",
+		"no supporting event was found or recorded in the available evidence",
+		"do not claim that the event did not occur or that the subject did not experience it",
+		"One clear qualification near the main conclusion is sufficient",
+		"do not hedge every sentence",
 		"at most one concise, complete uncertainty item",
 		"concrete user-facing language",
 		"Runtime-log coverage was incomplete for the last 24 hours",
@@ -499,11 +549,24 @@ func TestReasonerRequestInstructionsDoNotForceUncertaintyForCompleteEvidence(t *
 		Agreement:            AgreementConsistent,
 		Coverage:             CoverageComplete,
 	}
-	instructions := reasonerCoverageAnswerInstruction(packet)
-	if !strings.Contains(instructions, "Leave uncertainty empty") || !strings.Contains(instructions, "do not add a generic hedge") {
+	packetJSON, err := json.Marshal(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := (&app{}).buildReasonerRequest(
+		primaryModel,
+		"Did MyScheduler fail in the last 24 hours?",
+		packet,
+		packetJSON,
+	)
+	if len(request.Messages) != 2 {
+		t.Fatalf("reasoner request messages=%d, want 2", len(request.Messages))
+	}
+	instructions := request.Messages[1].Content
+	if !strings.Contains(instructions, "Direct evidence-supported negative conclusions are allowed") || !strings.Contains(instructions, "Leave uncertainty empty") || !strings.Contains(instructions, "do not add a generic hedge") {
 		t.Fatalf("complete-evidence instructions=%s", instructions)
 	}
-	for _, unwanted := range []string{"Evidence coverage is partial", "Runtime-log coverage was incomplete", "Some deployment details were unavailable"} {
+	for _, unwanted := range []string{"Evidence coverage is partial", "no supporting event was found or recorded", "Runtime-log coverage was incomplete", "Some deployment details were unavailable"} {
 		if strings.Contains(instructions, unwanted) {
 			t.Fatalf("complete evidence received unnecessary limitation %q: %s", unwanted, instructions)
 		}

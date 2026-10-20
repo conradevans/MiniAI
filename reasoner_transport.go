@@ -35,7 +35,7 @@ func (a *app) buildReasonerRequest(model, question string, packet EvidencePacket
 
 func reasonerAnswerInstructions(packet EvidencePacket) string {
 	instructions := []string{
-		"Lead with the direct conclusion. Synthesize overlapping evidence and state each conclusion once. Use facts for only the strongest distinct supporting points; do not restate the conclusion or another fact. Keep the answer concise and use evidence only to support the conclusion.",
+		"Lead with the direct conclusion. Synthesize overlapping evidence and state each conclusion once. Use facts for only the strongest distinct supporting points; do not restate the conclusion or another fact. Keep the answer concise and use evidence only to support the conclusion. Translate structured evidence fields into natural user-facing language. Never copy raw JSON keys, snake_case schema field names, or evidence packet property names into prose; for example, express latest_status as ordinary language rather than quoting the key. Do not treat underscores in genuine entity identifiers as schema leakage.",
 		reasonerTemporalAnswerInstruction(packet.Temporal),
 		reasonerCoverageAnswerInstruction(packet),
 	}
@@ -104,9 +104,9 @@ func reasonerNamedWindowPhrase(value string) (string, bool) {
 
 func reasonerCoverageAnswerInstruction(packet EvidencePacket) string {
 	if !reasonerPacketHasMaterialLimitation(packet) {
-		return "The packet records no material evidence limitation. Leave uncertainty empty unless the packet itself supports a material limitation or conflict; do not add a generic hedge."
+		return "The packet records no material evidence limitation. Direct evidence-supported negative conclusions are allowed. Leave uncertainty empty unless the packet itself supports a material limitation or conflict; do not add a generic hedge."
 	}
-	instruction := "Evidence coverage is partial or materially limited. Qualify conclusions as based on the available evidence instead of making absolute claims beyond that coverage. Include at most one concise, complete uncertainty item when the limitation materially affects the answer. Describe it in concrete user-facing language; do not expose requirement IDs, availability or error enums, packet or reducer fields, or provider or capability implementation names. Do not claim a specific missing period or facet unless the packet supports it."
+	instruction := "Evidence coverage is partial or materially limited. Qualify conclusions as based on the available evidence instead of making absolute claims beyond that coverage. For negative conclusions, say that no supporting event was found or recorded in the available evidence; do not claim that the event did not occur or that the subject did not experience it. One clear qualification near the main conclusion is sufficient; do not hedge every sentence. Include at most one concise, complete uncertainty item when the limitation materially affects the answer. Describe it in concrete user-facing language; do not expose requirement IDs, availability or error enums, packet or reducer fields, or provider or capability implementation names. Do not claim a specific missing period or facet unless the packet supports it."
 	if hints := reasonerUserFacingLimitationHints(packet); len(hints) > 0 {
 		instruction += " Supported context: " + strings.Join(hints, " ")
 	}
