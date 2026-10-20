@@ -14,7 +14,6 @@ func testReasonerPacket() EvidencePacket {
 	now := time.Date(2026, 9, 25, 18, 0, 0, 0, time.UTC)
 	return EvidencePacket{
 		SchemaVersion: evidencePacketSchemaVersion,
-		Question:      "is the dell healthy",
 		Route:         RouteCurrentPlatformHealth,
 		Goal:          GoalCurrentAssessment,
 		Subjects:      []EvidenceSubject{{Kind: SubjectHost, ID: "dell", Name: "Dell"}},
@@ -29,7 +28,7 @@ func testReasonerPacket() EvidencePacket {
 			SourceID: "source-1", RequirementID: "requirement-1", Criticality: CriticalityCritical,
 			Fields: []EvidenceField{evidenceStringField("status", "healthy")},
 		}},
-		Confidence: ConfidenceDecision{Level: ConfidenceHigh, SoftwareCeiling: ConfidenceHigh, Determined: true},
+		Confidence: EvidencePacketConfidence{Level: ConfidenceHigh, SoftwareCeiling: ConfidenceHigh},
 	}
 }
 

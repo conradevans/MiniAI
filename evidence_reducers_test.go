@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -377,7 +378,9 @@ func TestCompoundPartialFacetsRemainVisibleAndBoundConfidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(packetJSON), "recovery section unavailable") || !strings.Contains(string(packetJSON), `"availability":"partial"`) {
+	if len(packet.Missing) != 1 || packet.Missing[0].Criticality != CriticalitySupporting || packet.Missing[0].Availability != AvailabilityPartial ||
+		packet.Missing[0].Capability != "get_platform_overview" || packet.Missing[0].LimitationCode != "overview_recovery_unavailable" ||
+		packet.Missing[0].Reason != "" || !strings.Contains(string(packetJSON), `"availability":"partial"`) {
 		t.Fatalf("partial facet absent from packet: %s", packetJSON)
 	}
 
@@ -475,8 +478,12 @@ func TestCanonicalLogWindowIgnoresQuestionProseAndComputedSummaryIsDerived(t *te
 		t.Fatal("question prose changed canonical TemporalScope filtering")
 	}
 	observed, derived := firstItems[0], firstItems[1]
-	if observed.Kind != EvidenceObserved || derived.Kind != EvidenceDerived || fieldText(derived, "first_error_timestamp") != inside.Format(time.RFC3339Nano) ||
-		evidenceIntegerValue(derived, "error_count") != 1 || evidenceIntegerValue(observed, "included_lines") != 1 || evidenceIntegerValue(observed, "unfilterable_lines") != 1 {
+	var summary runtimeEvidenceSummary
+	if err := json.Unmarshal([]byte(fieldText(derived, "runtime_summary")), &summary); err != nil {
+		t.Fatal(err)
+	}
+	if observed.Kind != EvidenceObserved || derived.Kind != EvidenceDerived || len(summary.Patterns) != 1 || summary.Patterns[0].FirstTimestamp != inside.Format(time.RFC3339Nano) ||
+		summary.ErrorCount != 1 || evidenceIntegerValue(observed, "included_lines") != 1 || evidenceIntegerValue(observed, "unfilterable_lines") != 1 {
 		t.Fatalf("log observed/derived split=%s", canonicalJSON(firstItems))
 	}
 	if len(firstDerivations) != 1 || firstDerivations[0].Inputs[0] != observed.ID || firstDerivations[0].OutputID != derived.ID {
@@ -484,7 +491,7 @@ func TestCanonicalLogWindowIgnoresQuestionProseAndComputedSummaryIsDerived(t *te
 	}
 }
 
-func TestServiceCalculationsAreDerivedFromObservedPoints(t *testing.T) {
+func TestServiceHistorySeparatesObservedFactsAndDerivedSummary(t *testing.T) {
 	now := time.Date(2026, 9, 25, 18, 0, 0, 0, time.UTC)
 	from := now.Add(-time.Hour)
 	requirement := testRequirement(RouteApplicationPerformance, EvidenceTypeServiceHistory, CriticalityRelevant, EvidenceSubject{Kind: SubjectHost, ID: "dell"}, &TemporalScope{Kind: TemporalNamedWindow, NamedRange: "1h", Valid: true})
@@ -493,10 +500,26 @@ func TestServiceCalculationsAreDerivedFromObservedPoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(items) != 2 || items[0].Kind != EvidenceObserved || items[1].Kind != EvidenceDerived || evidenceFieldMap(items[0].Payload.Fields)["service_summaries"].Kind != "" || evidenceFieldMap(items[1].Payload.Fields)["service_summaries"].Kind == "" {
-		t.Fatalf("service observed/derived classification=%s", canonicalJSON(items))
+	if len(items) != 2 || items[0].Kind != EvidenceObserved || items[1].Kind != EvidenceDerived || len(derivations) != 1 {
+		t.Fatalf("service projection/lineage=%s/%+v", canonicalJSON(items), derivations)
 	}
-	if len(derivations) != 1 || derivations[0].Inputs[0] != items[0].ID || derivations[0].OutputID != items[1].ID {
+	var states []serviceLatestStateFact
+	if err := json.Unmarshal([]byte(fieldText(items[0], "service_states")), &states); err != nil {
+		t.Fatal(err)
+	}
+	var transitions []serviceTransitionFact
+	if err := json.Unmarshal([]byte(fieldText(items[0], "service_transitions")), &transitions); err != nil {
+		t.Fatal(err)
+	}
+	var summary serviceEvidenceSummary
+	if err := json.Unmarshal([]byte(fieldText(items[1], "service_summary")), &summary); err != nil {
+		t.Fatal(err)
+	}
+	if summary.ServiceCount != 1 || summary.UniqueServiceCount != 1 || summary.TransitionCount != 1 ||
+		len(states) != 1 || len(transitions) != 1 || hasEvidenceField(items[0], "service_summary") {
+		t.Fatalf("service semantic split=%s", canonicalJSON(items))
+	}
+	if len(derivations[0].Inputs) != 1 || derivations[0].Inputs[0] != items[0].ID || derivations[0].OutputID != items[1].ID {
 		t.Fatalf("service lineage=%+v", derivations)
 	}
 }

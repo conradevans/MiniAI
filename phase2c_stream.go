@@ -190,7 +190,7 @@ func (a *app) handlePhase2CStream(w http.ResponseWriter, r *http.Request, questi
 	prepared, prepareErr := pipeline.Prepare(question, routerContext)
 	if prepareErr != nil {
 		if isPhase2CReasonedRoute(prepared.Route.ID) {
-			a.emitPhase2CLimitation(w, prepared, nil, nil, started, "evidence_plan_invalid")
+			a.emitPhase2CLimitation(w, prepared, Phase2BResult{}, started, "evidence_plan_invalid")
 			return true
 		}
 		return false
@@ -215,7 +215,9 @@ func (a *app) handlePhase2CStream(w http.ResponseWriter, r *http.Request, questi
 		if r.Context().Err() != nil {
 			return true
 		}
-		a.emitPhase2CLimitation(w, prepared, nil, nil, started, "evidence_pipeline_failed")
+		limitation := phase2CPipelineLimitation(err)
+		logPhase2CPipelineFailure(prepared.Route.ID, result.Results, err)
+		a.emitPhase2CLimitation(w, prepared, result, started, limitation)
 		return true
 	}
 	if r.Context().Err() != nil {
@@ -391,6 +393,7 @@ func emitPhase2CToolEvents(w http.ResponseWriter, flusher http.Flusher, plan Evi
 		sendSSE(w, "tool", agentToolEvent{
 			RequestID: result.RequestID, Phase: "result", Name: result.Capability,
 			Arguments: cloneCanonicalArguments(result.Arguments), Summary: phase2CResultSummary(result),
+			Availability: result.Availability, ErrorCategory: result.ErrorCategory,
 		})
 	}
 	flusher.Flush()
@@ -448,39 +451,35 @@ func emitPhase2CPostEvidenceLimitation(w http.ResponseWriter, flusher http.Flush
 	)
 }
 
-func (a *app) emitPhase2CLimitation(w http.ResponseWriter, prepared Phase2BPrepared, results []EvidenceResult, packet []byte, started time.Time, reason string) {
+func (a *app) emitPhase2CLimitation(w http.ResponseWriter, prepared Phase2BPrepared, result Phase2BResult, started time.Time, reason string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming unsupported")
 		return
 	}
+	plan := result.Plan
+	if len(plan.Requests) == 0 {
+		plan = prepared.Plan
+	}
+	route := result.Route.ID
+	if route == "" {
+		route = prepared.Route.ID
+	}
+	evidenceRounds := result.EvidenceRounds
+	toolCalls := len(result.Results)
+	packetBytes := len(result.PacketJSON)
 	setSSEHeaders(w)
 	sendSSE(w, "meta", map[string]any{
-		"answer_mode": "phase2c", "route": prepared.Route.ID, "agent": true,
-		"planner_calls": 0, "reasoner_calls": 0, "tool_calls": prepared.Plan.LogicalReads,
-		"evidence_rounds": 1, "second_round_reads": 0,
-		"evidence_packet_bytes": len(packet), "limitation": reason,
+		"answer_mode": "phase2c", "route": route, "agent": true,
+		"planner_calls": 0, "reasoner_calls": 0, "tool_calls": toolCalls,
+		"evidence_rounds": evidenceRounds, "second_round_reads": result.SecondRoundReads,
+		"evidence_packet_bytes": packetBytes, "limitation": reason,
 	})
-	if len(prepared.Plan.Requests) > 0 {
-		if len(results) == 0 {
-			results = phase2CUnavailableResults(prepared.Plan)
-		}
-		emitPhase2CToolEvents(w, flusher, prepared.Plan, results)
+	if len(result.Results) > 0 {
+		emitPhase2CToolEvents(w, flusher, plan, result.Results)
 	}
 	emitBufferedAnswer(w, flusher, safeReasonerLimitation())
-	emitPhase2CDone(w, flusher, modelPolicy{}, prepared.Route.ID, prepared.Plan.LogicalReads, 1, 0, len(packet), 0, chatAPIResponse{}, started, reason, ConfidenceLow)
-}
-
-func phase2CUnavailableResults(plan EvidencePlan) []EvidenceResult {
-	results := make([]EvidenceResult, 0, len(plan.Requests))
-	for _, request := range plan.Requests {
-		results = append(results, EvidenceResult{
-			RequestID: request.ID, PlanOrder: request.Order, Capability: request.Capability,
-			Arguments:    cloneCanonicalArguments(request.Arguments),
-			Availability: AvailabilityUnavailable, ErrorCategory: EvidenceErrorInternal,
-		})
-	}
-	return results
+	emitPhase2CDone(w, flusher, modelPolicy{}, route, toolCalls, evidenceRounds, result.SecondRoundReads, packetBytes, 0, chatAPIResponse{}, started, reason, ConfidenceLow)
 }
 
 func emitPhase2CClarification(w http.ResponseWriter, decision ShadowRouteDecision, answer string) {

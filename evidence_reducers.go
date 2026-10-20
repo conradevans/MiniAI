@@ -11,10 +11,58 @@ import (
 )
 
 const (
-	phase2BTimelineLimit           = 20
-	phase2BRepositoryFileRunes     = 1200
-	currentEndpointFreshnessPolicy = "phase2b.current_endpoint_collection.v1"
+	phase2BTimelineLimit              = 20
+	phase2BApplicationIdentityRunes   = 64
+	phase2BApplicationCandidateLimit  = 5
+	phase2BApplicationTransitionLimit = 4
+	phase2BServiceSummaryLimit        = 2
+	phase2BServiceTransitionLimit     = 6
+	phase2BRuntimePatternLimit        = 2
+	phase2BTransitionStatusRunes      = 12
+	phase2BServiceIdentityRunes       = 12
+	phase2BRuntimeSignatureRunes      = 80
+	phase2BRepositoryFileRunes        = 1200
+	currentEndpointFreshnessPolicy    = "phase2b.current_endpoint_collection.v1"
 )
+
+type serviceTransitionFact struct {
+	ID        string `json:"id"`
+	Timestamp string `json:"at"`
+	Available bool   `json:"up"`
+	From      string `json:"from,omitempty"`
+	To        string `json:"to,omitempty"`
+}
+
+type serviceLatestStateFact struct {
+	ID          string `json:"id"`
+	Timestamp   string `json:"at"`
+	Available   bool   `json:"up"`
+	Status      string `json:"status,omitempty"`
+	SampleCount int    `json:"samples,omitempty"`
+}
+
+type serviceEvidenceSummary struct {
+	ServiceCount           int `json:"service_count"`
+	UniqueServiceCount     int `json:"unique_count"`
+	TransitionCount        int `json:"transition_count"`
+	TransitionsOmitted     int `json:"transitions_omitted,omitempty"`
+	ServicesOmitted        int `json:"services_omitted,omitempty"`
+	ServicesWithoutSamples int `json:"services_without_samples,omitempty"`
+	DeduplicatedPointCount int `json:"deduplicated_points,omitempty"`
+}
+
+type runtimeErrorPattern struct {
+	Signature      string `json:"signature"`
+	Occurrences    int    `json:"count"`
+	FirstTimestamp string `json:"first,omitempty"`
+	LastTimestamp  string `json:"last,omitempty"`
+}
+
+type runtimeEvidenceSummary struct {
+	ErrorCount   int                   `json:"error_count"`
+	RestartCount int                   `json:"restart_count"`
+	Patterns     []runtimeErrorPattern `json:"error_patterns,omitempty"`
+}
 
 type evidenceReducer func(EvidenceResult, EvidenceRequirement, string, string) ([]EvidenceItem, []Derivation, error)
 
@@ -339,7 +387,8 @@ func reduceApplicationList(result EvidenceResult, requirement EvidenceRequiremen
 	}
 	apps := append([]reactorLabAppSummary(nil), value.Apps...)
 	sort.Slice(apps, func(i, j int) bool { return apps[i].App < apps[j].App })
-	if requirement.Type != EvidenceTypeCurrentDeploymentList && requirement.Subject.ID != "" && requirement.Subject.ID != "all" && requirement.Subject.ID != "unresolved" {
+	filteredBySubject := requirement.Type != EvidenceTypeCurrentDeploymentList && requirement.Subject.ID != "" && requirement.Subject.ID != "all" && requirement.Subject.ID != "unresolved"
+	if filteredBySubject {
 		filtered := apps[:0]
 		for _, application := range apps {
 			if strings.EqualFold(application.App, requirement.Subject.ID) || strings.EqualFold(application.App, requirement.Subject.Name) {
@@ -348,19 +397,40 @@ func reduceApplicationList(result EvidenceResult, requirement EvidenceRequiremen
 		}
 		apps = filtered
 	}
-	items := make([]EvidenceItem, 0, len(apps))
-	for index, application := range apps {
-		subjectRequirement := requirement
-		subjectRequirement.Subject = EvidenceSubject{Kind: SubjectApplication, ID: application.App, Name: application.App}
-		fields := deploymentFields(application.App, application.Status, application.Strategy, application.ImageID, application.Source, application.ActivatedAt)
-		item := observedItem(result, subjectRequirement, sourceID, application.ActivatedAt, fields)
-		item.ID += ":" + strconv.Itoa(index)
-		items = append(items, item)
+	matchedApplications := len(apps)
+	if !filteredBySubject {
+		matchedApplications = max(value.TotalApps, matchedApplications)
 	}
-	if len(items) == 0 {
-		items = append(items, observedItem(result, requirement, sourceID, nil, []EvidenceField{integerField("matched_applications", 0)}))
+	fields := []EvidenceField{integerField("matched_applications", int64(matchedApplications))}
+	var timestamp *time.Time
+	if matchedApplications == 1 && len(apps) == 1 {
+		application := apps[0]
+		fields = append(fields, deploymentFields(application.App, application.Status, application.Strategy, application.ImageID, application.Source, application.ActivatedAt)...)
+		timestamp = application.ActivatedAt
+	} else if matchedApplications > 1 {
+		type applicationCandidate struct {
+			Application string `json:"application"`
+			Status      string `json:"status,omitempty"`
+		}
+		retained := apps
+		if len(retained) > phase2BApplicationCandidateLimit {
+			retained = retained[:phase2BApplicationCandidateLimit]
+		}
+		candidates := make([]applicationCandidate, 0, len(retained))
+		for _, application := range retained {
+			candidates = append(candidates, applicationCandidate{
+				Application: truncateIdentityRunes(application.App, phase2BApplicationIdentityRunes),
+				Status:      truncateRunes(application.Status, phase2BTransitionStatusRunes-1),
+			})
+		}
+		fields = append(fields,
+			jsonField("application_candidates", candidates),
+			integerField("candidates_included", int64(len(candidates))),
+			boolFieldValue("ambiguous", true),
+			boolFieldValue("candidates_truncated", matchedApplications > len(candidates)),
+		)
 	}
-	return items, nil, nil
+	return []EvidenceItem{observedItem(result, requirement, sourceID, timestamp, fields)}, nil, nil
 }
 
 func reduceApplicationContext(result EvidenceResult, requirement EvidenceRequirement, sourceID, _ string) ([]EvidenceItem, []Derivation, error) {
@@ -369,32 +439,21 @@ func reduceApplicationContext(result EvidenceResult, requirement EvidenceRequire
 		return nil, nil, fmt.Errorf("unexpected app context result")
 	}
 	fields := deploymentFields(value.App, value.Deployment.Status, value.Deployment.Strategy, value.Deployment.ImageID, value.Deployment.Source, value.Deployment.ActivatedAt)
+	fields = filterEvidenceFields(fields,
+		"activated_at", "branch", "commit_sha", "image_id", "repository",
+		"requested_ref", "status",
+	)
 	failureIDs := make([]string, 0, len(value.DatabaseLookupFailures))
 	for _, failure := range value.DatabaseLookupFailures {
 		failureIDs = append(failureIDs, failure.DatabaseID)
 	}
 	failureIDs = sortedUniqueContractStrings(failureIDs)
 	fields = append(fields,
-		boolFieldValue("source_available", value.SourceAvailable),
-		boolFieldValue("overview_available", value.Overview.Available),
-		boolFieldValue("overview_system_available", value.Overview.System.Available),
-		boolFieldValue("overview_recovery_available", value.Overview.Recovery.Available),
-		boolFieldValue("overview_observability_available", value.Overview.Observability.Available),
 		integerField("database_count", int64(len(value.Databases))),
-		integerField("database_lookups_requested", int64(value.DatabaseLookupsRequested)),
-		integerField("database_lookup_failure_count", int64(len(failureIDs))),
-		jsonField("database_lookup_failure_ids", failureIDs),
-		boolFieldValue("database_lookups_truncated", value.DatabaseLookupsTruncated),
 		boolFieldValue("database_coverage_complete", !value.DatabaseLookupsTruncated && len(failureIDs) == 0),
 		evidenceStringField("repository_branch", value.LocalRepository.Branch),
 		evidenceStringField("repository_commit", value.LocalRepository.Commit),
 	)
-	if !value.Overview.Available {
-		fields = append(fields, evidenceStringField("overview_error_category", string(EvidenceErrorUnavailable)))
-	}
-	if value.Overview.CollectedAt != nil {
-		fields = append(fields, timestampField("overview_collected_at", *value.Overview.CollectedAt))
-	}
 	item := observedItem(result, requirement, sourceID, value.Deployment.ActivatedAt, fields)
 	return []EvidenceItem{item}, nil, nil
 }
@@ -474,21 +533,29 @@ func reduceApplicationHistory(result EvidenceResult, requirement EvidenceRequire
 	points, deduplicatedPoints, equalTimestampPoints := canonicalMetricPoints(value.History.Points, func(point reactorLabApplicationPoint) time.Time {
 		return point.Timestamp
 	})
-	fields := windowFields(value.History.Window, len(points), value.History.TotalPoints)
-	fields = append(fields,
-		evidenceStringField("application_id", value.Application.ID), evidenceStringField("application_name", value.Application.Name),
+	transitions, transitionCount := salientApplicationTransitions(points)
+	observedFields := []EvidenceField{
+		timestampField("coverage_from", value.History.Window.From),
+		timestampField("coverage_to", value.History.Window.To),
+		integerField("total_points", int64(value.History.TotalPoints)),
 		evidenceStringField("latest_status", value.Application.LatestStatus), integerField("restart_count", int64(value.Application.RestartCount)),
-		jsonField("salient_values", salientApplicationPoints(points)),
-	)
+		jsonField("state_transitions", transitions),
+	}
 	latest := optionalLatestApplicationTimestamp(points)
-	observed := observedItem(result, requirement, sourceID, latest, fields)
-	derivedFields := summarizeApplicationPoints(points)
+	observed := observedItem(result, requirement, sourceID, latest, observedFields)
+	derivedFields := filterEvidenceFields(summarizeApplicationPoints(points),
+		"cpu_average", "cpu_maximum", "memory_used_bytes_average", "memory_used_bytes_maximum",
+		"first_status", "first_restart_count", "transition_count",
+	)
+	if transitionCount > len(transitions) {
+		derivedFields = append(derivedFields, boolFieldValue("transitions_truncated", true))
+	}
 	derivedFields = append(derivedFields,
 		integerField("coverage_gap_count", int64(timestampGapCount(applicationPointTimes(points), value.History.Window.BucketSeconds))),
 		integerField("deduplicated_point_count", int64(deduplicatedPoints)),
 		boolFieldValue("equal_timestamp_values_canonically_ordered", equalTimestampPoints),
 	)
-	derived, derivation := derivedItem(result, requirement, sourceID, "metric_summary", observed.ID, latest, derivedFields)
+	derived, derivation := derivedItem(result, requirement, sourceID, "application_history_summary", observed.ID, latest, derivedFields)
 	return []EvidenceItem{observed, derived}, []Derivation{derivation}, nil
 }
 
@@ -497,79 +564,97 @@ func reduceServiceHistory(result EvidenceResult, requirement EvidenceRequirement
 	if !ok {
 		return nil, nil, fmt.Errorf("unexpected service history result")
 	}
-	services := append([]reactorLabServiceSeries(nil), value.Services...)
-	sort.Slice(services, func(i, j int) bool {
-		if services[i].ID != services[j].ID {
-			return services[i].ID < services[j].ID
-		}
-		if services[i].Name != services[j].Name {
-			return services[i].Name < services[j].Name
-		}
-		return canonicalJSON(services[i]) < canonicalJSON(services[j])
-	})
-	type servicePointFact struct {
-		ID          string    `json:"id"`
-		Name        string    `json:"name"`
-		Timestamp   time.Time `json:"timestamp"`
-		SampleCount int       `json:"sampleCount"`
-		Available   bool      `json:"available"`
-		Status      string    `json:"status"`
+	services := collapseServiceSeries(value.Services)
+	facts := []serviceTransitionFact{}
+	type serviceStateCandidate struct {
+		Fact        serviceLatestStateFact
+		Transitions int
 	}
-	type serviceSummary struct {
-		ID          string `json:"id"`
-		Name        string `json:"name"`
-		Samples     int    `json:"samples"`
-		FirstStatus string `json:"firstStatus,omitempty"`
-		LastStatus  string `json:"lastStatus,omitempty"`
-		Transitions int    `json:"transitions"`
-	}
-	facts := []servicePointFact{}
-	summaries := make([]serviceSummary, 0, len(services))
+	states := make([]serviceStateCandidate, 0, len(services))
 	var latest *time.Time
+	totalTransitions := 0
 	deduplicatedPointCount := 0
-	equalTimestampValues := false
+	servicesWithoutSamples := 0
 	for _, service := range services {
-		points, removed, equalTimestamps := canonicalMetricPoints(service.Points, func(point reactorLabServicePoint) time.Time {
+		points, removed, _ := canonicalMetricPoints(service.Points, func(point reactorLabServicePoint) time.Time {
 			return point.Timestamp
 		})
 		deduplicatedPointCount += removed
-		equalTimestampValues = equalTimestampValues || equalTimestamps
-		summary := serviceSummary{ID: service.ID, Name: service.Name, Samples: len(points)}
-		if len(points) > 0 {
-			summary.FirstStatus, summary.LastStatus = points[0].Status, points[len(points)-1].Status
-			for index, point := range points {
-				facts = append(facts, servicePointFact{
-					ID: service.ID, Name: service.Name, Timestamp: point.Timestamp.UTC(),
-					SampleCount: point.SampleCount, Available: point.Available, Status: point.Status,
-				})
-				if index > 0 && (point.Available != points[index-1].Available || point.Status != points[index-1].Status) {
-					summary.Transitions++
-				}
-			}
-			timestamp := points[len(points)-1].Timestamp.UTC()
-			if latest == nil || timestamp.After(*latest) {
-				latest = &timestamp
-			}
+		serviceID := strings.TrimSpace(service.ID)
+		if serviceID == "" {
+			serviceID = strings.TrimSpace(service.Name)
 		}
-		summaries = append(summaries, summary)
+		if serviceID == "" {
+			serviceID = "unidentified"
+		}
+		serviceID = compactServiceIdentity(serviceID, phase2BServiceIdentityRunes)
+		if len(points) == 0 {
+			servicesWithoutSamples++
+			continue
+		}
+		transitions := 0
+		last := points[len(points)-1]
+		for index := 1; index < len(points); index++ {
+			point, previous := points[index], points[index-1]
+			if point.Available == previous.Available && point.Status == previous.Status {
+				continue
+			}
+			facts = append(facts, serviceTransitionFact{
+				ID:        serviceID,
+				Timestamp: point.Timestamp.UTC().Format(time.RFC3339Nano), Available: point.Available,
+				From: truncateRunes(previous.Status, phase2BTransitionStatusRunes-1),
+				To:   truncateRunes(point.Status, phase2BTransitionStatusRunes-1),
+			})
+			transitions++
+			totalTransitions++
+		}
+		states = append(states, serviceStateCandidate{Fact: serviceLatestStateFact{
+			ID: serviceID, Timestamp: last.Timestamp.UTC().Format(time.RFC3339Nano), Available: last.Available,
+			Status: truncateRunes(last.Status, phase2BTransitionStatusRunes-1), SampleCount: last.SampleCount,
+		}, Transitions: transitions})
+		timestamp := last.Timestamp.UTC()
+		if latest == nil || timestamp.After(*latest) {
+			latest = &timestamp
+		}
 	}
-	selectedFacts, omittedFacts := boundedSlice(facts, phase2BTimelineLimit)
+	sort.Slice(facts, func(i, j int) bool {
+		if facts[i].Timestamp != facts[j].Timestamp {
+			return facts[i].Timestamp < facts[j].Timestamp
+		}
+		return canonicalJSON(facts[i]) < canonicalJSON(facts[j])
+	})
+	selectedFacts, omittedTransitions := selectFirstAndLast(facts, phase2BServiceTransitionLimit)
+	sort.Slice(states, func(i, j int) bool {
+		if states[i].Fact.Available != states[j].Fact.Available {
+			return !states[i].Fact.Available
+		}
+		if states[i].Transitions != states[j].Transitions {
+			return states[i].Transitions > states[j].Transitions
+		}
+		if states[i].Fact.Timestamp != states[j].Fact.Timestamp {
+			return states[i].Fact.Timestamp > states[j].Fact.Timestamp
+		}
+		return canonicalJSON(states[i].Fact) < canonicalJSON(states[j].Fact)
+	})
+	omittedStates := 0
+	if len(states) > phase2BServiceSummaryLimit {
+		omittedStates = len(states) - phase2BServiceSummaryLimit
+		states = states[:phase2BServiceSummaryLimit]
+	}
+	selectedStates := make([]serviceLatestStateFact, 0, len(states))
+	for _, state := range states {
+		selectedStates = append(selectedStates, state.Fact)
+	}
 	observedFields := []EvidenceField{
-		evidenceStringField("requested_range", value.Window.Range),
-		timestampField("coverage_from", value.Window.From),
-		timestampField("coverage_to", value.Window.To),
-		decimalField("bucket_seconds", value.Window.BucketSeconds),
-		integerField("service_count", int64(len(services))),
-		integerField("returned_service_points", int64(len(facts))),
-		jsonField("service_points", selectedFacts),
-		integerField("reducer_omitted", int64(omittedFacts)),
+		timestampField("coverage_from", value.Window.From), timestampField("coverage_to", value.Window.To),
+		jsonField("service_states", selectedStates), jsonField("service_transitions", selectedFacts),
 	}
 	observed := observedItem(result, requirement, sourceID, latest, observedFields)
-	derivedFields := []EvidenceField{
-		jsonField("service_summaries", summaries),
-		integerField("deduplicated_point_count", int64(deduplicatedPointCount)),
-		boolFieldValue("equal_timestamp_values_canonically_ordered", equalTimestampValues),
-	}
+	derivedFields := []EvidenceField{jsonField("service_summary", serviceEvidenceSummary{
+		ServiceCount: max(value.TotalServices, len(value.Services)), UniqueServiceCount: len(services),
+		TransitionCount: totalTransitions, TransitionsOmitted: omittedTransitions,
+		ServicesOmitted: omittedStates, ServicesWithoutSamples: servicesWithoutSamples, DeduplicatedPointCount: deduplicatedPointCount,
+	})}
 	derived, derivation := derivedItem(result, requirement, sourceID, "service_summary", observed.ID, latest, derivedFields)
 	return []EvidenceItem{observed, derived}, []Derivation{derivation}, nil
 }
@@ -794,16 +879,11 @@ func reduceLogs(result EvidenceResult, requirement EvidenceRequirement, sourceID
 	filtered, coverage := filterLogResponseToRequirementWindow(value, requirement.Window, result.CompletedAt)
 	summary := summarizeDiagnosticLogs(filtered, "", result.CompletedAt)
 	observedFields := []EvidenceField{
-		evidenceStringField("application", value.App),
-		evidenceStringField("log_kind", value.Kind),
 		integerField("source_lines", int64(coverage.OriginalLines)),
 		integerField("included_lines", int64(coverage.IncludedLines)),
 		integerField("unfilterable_lines", int64(coverage.UnfilterableLines)),
-		boolFieldValue("window_filter_applied", coverage.FilterApplied),
-		boolFieldValue("coverage_complete", coverage.Complete),
 		boolFieldValue("coverage_incomplete", !coverage.Complete),
 		boolFieldValue("source_truncated", value.Truncated),
-		boolFieldValue("redacted", summary.Redacted),
 	}
 	if coverage.From != nil && coverage.To != nil {
 		observedFields = append(observedFields,
@@ -812,16 +892,19 @@ func reduceLogs(result EvidenceResult, requirement EvidenceRequirement, sourceID
 		)
 	}
 	observed := observedItem(result, requirement, sourceID, coverage.Latest, observedFields)
+	patternCount := min(len(summary.Patterns), phase2BRuntimePatternLimit)
+	patterns := make([]runtimeErrorPattern, 0, patternCount)
+	for _, pattern := range summary.Patterns[:patternCount] {
+		patterns = append(patterns, runtimeErrorPattern{
+			Signature: truncateRunes(pattern.Signature, phase2BRuntimeSignatureRunes-1), Occurrences: pattern.Occurrences,
+			FirstTimestamp: truncateRunes(pattern.FirstTimestamp, 40), LastTimestamp: truncateRunes(pattern.LastTimestamp, 40),
+		})
+	}
 	derivedFields := []EvidenceField{
-		integerField("lines_examined", int64(summary.LinesExamined)),
-		integerField("error_count", int64(summary.ErrorCount)),
-		integerField("warning_count", int64(summary.WarningCount)),
-		integerField("restart_count", int64(summary.RestartCount)),
-		evidenceStringField("first_error_timestamp", summary.FirstErrorTimestamp),
-		evidenceStringField("last_error_timestamp", summary.LastErrorTimestamp),
-		evidenceStringField("last_restart_timestamp", summary.LastRestartTimestamp),
-		jsonField("error_patterns", summary.Patterns),
-		boolFieldValue("truncated", summary.Truncated),
+		jsonField("runtime_summary", runtimeEvidenceSummary{ErrorCount: summary.ErrorCount, RestartCount: summary.RestartCount, Patterns: patterns}),
+	}
+	if summary.Truncated || len(summary.Patterns) > len(patterns) {
+		derivedFields = append(derivedFields, boolFieldValue("truncated", true))
 	}
 	derived, derivation := derivedItem(result, requirement, sourceID, "log_summary", observed.ID, coverage.Latest, derivedFields)
 	return []EvidenceItem{observed, derived}, []Derivation{derivation}, nil
@@ -1372,34 +1455,37 @@ func salientTemperaturePoints(points []reactorLabTemperaturePoint) any {
 	return out
 }
 
-func salientApplicationPoints(points []reactorLabApplicationPoint) any {
-	type salient struct {
-		Timestamp time.Time `json:"timestamp"`
-		CPU       float64   `json:"cpuAverage"`
-		Memory    float64   `json:"memoryUsedAverage"`
-		Status    string    `json:"status"`
-		Restarts  int       `json:"restartCount"`
-	}
-	peak, trough := 0, 0
-	transition := -1
-	for index := range points {
-		if points[index].CPUMaximum > points[peak].CPUMaximum {
-			peak = index
+type applicationStateTransition struct {
+	Timestamp  time.Time `json:"at"`
+	FromStatus string    `json:"from"`
+	ToStatus   string    `json:"to"`
+	Restarts   [2]int    `json:"restarts"`
+}
+
+func salientApplicationTransitions(points []reactorLabApplicationPoint) ([]applicationStateTransition, int) {
+	transitions := make([]applicationStateTransition, 0)
+	for index := 1; index < len(points); index++ {
+		previous, current := points[index-1], points[index]
+		if current.Status == previous.Status && current.RestartCount == previous.RestartCount {
+			continue
 		}
-		if points[index].CPUAverage < points[trough].CPUAverage {
-			trough = index
-		}
-		if index > 0 && transition < 0 && (points[index].Status != points[index-1].Status || points[index].RestartCount != points[index-1].RestartCount) {
-			transition = index
-		}
+		transitions = append(transitions, applicationStateTransition{
+			Timestamp:  current.Timestamp.UTC(),
+			FromStatus: truncateRunes(previous.Status, phase2BTransitionStatusRunes-1),
+			ToStatus:   truncateRunes(current.Status, phase2BTransitionStatusRunes-1),
+			Restarts:   [2]int{previous.RestartCount, current.RestartCount},
+		})
 	}
-	indices := salientIndices(len(points), peak, trough, transition)
-	out := make([]salient, 0, len(indices))
-	for _, index := range indices {
-		point := points[index]
-		out = append(out, salient{point.Timestamp, point.CPUAverage, point.MemoryUsedAverage, point.Status, point.RestartCount})
+	total := len(transitions)
+	if total <= phase2BApplicationTransitionLimit {
+		return transitions, total
 	}
-	return out
+	head := phase2BApplicationTransitionLimit / 2
+	tail := phase2BApplicationTransitionLimit - head
+	selected := make([]applicationStateTransition, 0, phase2BApplicationTransitionLimit)
+	selected = append(selected, transitions[:head]...)
+	selected = append(selected, transitions[total-tail:]...)
+	return selected, total
 }
 
 func salientIndices(length int, candidates ...int) []int {
@@ -1479,7 +1565,7 @@ func evidenceItemsReportTruncation(items []EvidenceItem) bool {
 	for _, item := range items {
 		for _, field := range item.Payload.Fields {
 			switch field.Name {
-			case "snippet_truncated", "source_truncated", "coverage_incomplete":
+			case "snippet_truncated", "source_truncated", "coverage_incomplete", "truncated":
 				if field.Value.Boolean != nil && *field.Value.Boolean {
 					return true
 				}
@@ -1760,9 +1846,23 @@ func durationField(name string, value time.Duration) EvidenceField {
 }
 
 func jsonField(name string, value any) EvidenceField {
-	encoded, err := json.Marshal(value)
+	encoded, err := marshalJSONWithoutHTMLEscape(value)
 	if err != nil {
 		panic(err)
 	}
 	return evidenceStringField(name, string(encoded))
+}
+
+func filterEvidenceFields(fields []EvidenceField, names ...string) []EvidenceField {
+	allowed := make(map[string]bool, len(names))
+	for _, name := range names {
+		allowed[name] = true
+	}
+	filtered := make([]EvidenceField, 0, len(fields))
+	for _, field := range fields {
+		if allowed[field.Name] {
+			filtered = append(filtered, field)
+		}
+	}
+	return filtered
 }

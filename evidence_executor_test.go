@@ -343,3 +343,30 @@ func TestEvidenceExecutorCancellationAuthoritativelyPreventsHandlerStarts(t *tes
 		}
 	})
 }
+
+type perReadTimeoutExecutor struct{}
+
+func (perReadTimeoutExecutor) Execute(ctx context.Context, name string, _ map[string]any) (any, string, error) {
+	if name != "read_host_history" {
+		return map[string]any{"capability": name}, "safe " + name, nil
+	}
+	readContext, cancel := context.WithTimeout(ctx, 5*time.Millisecond)
+	defer cancel()
+	<-readContext.Done()
+	return nil, "", readContext.Err()
+}
+
+func TestEvidenceExecutorPerReadTimeoutDoesNotCancelSibling(t *testing.T) {
+	now := time.Date(2026, 9, 28, 5, 6, 47, 0, time.UTC)
+	plan := testEvidencePlan([]string{"read_host_history", "read_service_history"})
+	results, err := NewEvidenceExecutor(phase0CapabilityRegistry(), perReadTimeoutExecutor{}, func() time.Time { return now }).Execute(t.Context(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 || results[0].Availability != AvailabilityUnavailable || results[0].ErrorCategory != EvidenceErrorTimeout {
+		t.Fatalf("timeout result=%+v", results)
+	}
+	if results[1].Availability != AvailabilityAvailable || results[1].ErrorCategory != "" {
+		t.Fatalf("timeout canceled independent sibling: %+v", results)
+	}
+}

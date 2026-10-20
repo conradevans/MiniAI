@@ -264,12 +264,13 @@ func (derivation Derivation) WithStableID() Derivation {
 }
 
 type MissingEvidence struct {
-	RequirementID string                 `json:"requirementId"`
-	Criticality   RequirementCriticality `json:"criticality"`
-	Capability    string                 `json:"capability,omitempty"`
-	Availability  Availability           `json:"availability"`
-	ErrorCategory EvidenceErrorCategory  `json:"errorCategory,omitempty"`
-	Reason        string                 `json:"reason,omitempty"`
+	RequirementID  string                 `json:"requirementId"`
+	Criticality    RequirementCriticality `json:"criticality"`
+	Capability     string                 `json:"capability,omitempty"`
+	Availability   Availability           `json:"availability"`
+	ErrorCategory  EvidenceErrorCategory  `json:"errorCategory,omitempty"`
+	LimitationCode string                 `json:"limitationCode,omitempty"`
+	Reason         string                 `json:"reason,omitempty"`
 }
 
 type EvidenceConflict struct {

@@ -83,28 +83,32 @@ func (pipeline Phase2BPipeline) Prepare(question string, routerContext ShadowRou
 }
 
 func (pipeline Phase2BPipeline) ExecutePrepared(ctx context.Context, prepared Phase2BPrepared) (Phase2BResult, error) {
+	result := Phase2BResult{Route: prepared.Route, Plan: prepared.Plan}
 	if prepared.Route.Resolution != RouteResolutionSupported {
-		return Phase2BResult{}, fmt.Errorf("phase2b route is %s: %s", prepared.Route.Resolution, prepared.Route.Reason)
+		return result, fmt.Errorf("phase2b route is %s: %s", prepared.Route.Resolution, prepared.Route.Reason)
 	}
 	if err := ctx.Err(); err != nil {
-		return Phase2BResult{}, err
+		return result, err
 	}
 	executor := NewEvidenceExecutor(pipeline.registry, pipeline.executor, pipeline.now)
 	firstResults, err := executor.Execute(ctx, prepared.Plan)
 	if err != nil {
-		return Phase2BResult{}, err
+		return result, newPhase2BPipelineError(Phase2BStageEvidenceExecution, Phase2BPipelineErrorExecutionFailed, err)
 	}
+	result.Results = firstResults
+	result.EvidenceRounds = 1
 	if err := ctx.Err(); err != nil {
-		return Phase2BResult{}, err
+		return result, err
 	}
 	firstEvidence, err := pipeline.reduceEvidence(
 		prepared.Route.RouteDescriptor(), prepared.NormalizedQuestion,
 		prepared.Route.Requirements, prepared.Plan, firstResults,
 	)
 	if err != nil {
-		return Phase2BResult{}, err
+		return result, newPhase2BPipelineError(Phase2BStageEvidenceReduction, Phase2BPipelineErrorReductionFailed, err)
 	}
 	firstEvidence = ApplyEvidenceConfidence(firstEvidence)
+	result.Evidence = firstEvidence
 
 	plan := prepared.Plan
 	results := firstResults
@@ -115,11 +119,11 @@ func (pipeline Phase2BPipeline) ExecutePrepared(ctx context.Context, prepared Ph
 	secondRound := PlanSecondEvidenceRound(prepared, firstEvidence, prepared.Plan, firstResults, pipeline.registry)
 	if secondRound.Needed {
 		if err := ctx.Err(); err != nil {
-			return Phase2BResult{}, err
+			return result, err
 		}
 		followUpResults, executeErr := executor.Execute(ctx, secondRound.Plan)
 		if err := ctx.Err(); err != nil {
-			return Phase2BResult{}, err
+			return result, err
 		}
 		if executeErr != nil {
 			secondRound.Reason = FollowUpExecutionFailed
@@ -163,23 +167,27 @@ func (pipeline Phase2BPipeline) ExecutePrepared(ctx context.Context, prepared Ph
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return Phase2BResult{}, err
+		return result, err
 	}
 	evidence = ApplyEvidenceConfidence(evidence)
+	result.Plan = plan
+	result.Results = results
+	result.Evidence = evidence
+	result.EvidenceRounds = evidenceRounds
+	result.SecondRoundReads = secondRoundReads
+	result.EvidenceProcessingLimitation = processingLimitation
+	result.SecondRound = secondRound
 	packet, err := BuildEvidencePacket(evidence)
 	if err != nil {
-		return Phase2BResult{}, err
+		return result, newPhase2BPipelineError(Phase2BStagePacketBuild, Phase2BPipelineErrorPacketBuild, err)
 	}
+	result.Packet = packet
 	packetJSON, err := MarshalEvidencePacket(packet)
 	if err != nil {
-		return Phase2BResult{}, err
+		return result, newPhase2BPipelineError(Phase2BStagePacketMarshal, Phase2BPipelineErrorPacketMarshal, err)
 	}
-	return Phase2BResult{
-		Route: prepared.Route, Plan: plan, Results: results,
-		Evidence: evidence, Packet: packet, PacketJSON: packetJSON,
-		EvidenceRounds: evidenceRounds, SecondRoundReads: secondRoundReads,
-		EvidenceProcessingLimitation: processingLimitation, SecondRound: secondRound,
-	}, nil
+	result.PacketJSON = packetJSON
+	return result, nil
 }
 
 func (pipeline Phase2BPipeline) Run(ctx context.Context, question string, routerContext ShadowRouterContext) (Phase2BResult, error) {

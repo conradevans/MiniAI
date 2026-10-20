@@ -74,7 +74,7 @@ func TestEvidencePacketCompactsAtTargetAndPreservesCriticalExactFacts(t *testing
 	}
 }
 
-func TestEvidencePacketHardLimitFailsInsteadOfTruncatingCriticalValue(t *testing.T) {
+func TestEvidencePacketBoundsOversizedCriticalStringSemantically(t *testing.T) {
 	now := time.Date(2026, 9, 25, 18, 0, 0, 0, time.UTC)
 	requirement := testRequirement(RouteCurrentPlatformHealth, EvidenceTypeCurrentPlatformState, CriticalityCritical, EvidenceSubject{Kind: SubjectHost, ID: "dell"}, &TemporalScope{Kind: TemporalNow, At: &now, Valid: true})
 	evidence := InvestigationEvidence{
@@ -88,8 +88,54 @@ func TestEvidencePacketHardLimitFailsInsteadOfTruncatingCriticalValue(t *testing
 		t.Fatal(err)
 	}
 	normalized = ApplyEvidenceConfidence(normalized)
-	if _, err := BuildEvidencePacket(normalized); !errors.Is(err, errEvidencePacketTooLarge) {
-		t.Fatalf("hard-limit error=%v", err)
+	packet, err := BuildEvidencePacket(normalized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := packet.Evidence[0].Fields[0].Value.String
+	if len([]rune(value)) > evidencePacketStringRunes || !strings.HasSuffix(value, "…") {
+		t.Fatalf("bounded value runes=%d suffix=%q", len([]rune(value)), value)
+	}
+}
+
+func TestEvidencePacketRejectsIrreducibleCriticalCardinality(t *testing.T) {
+	now := time.Date(2026, 9, 25, 18, 0, 0, 0, time.UTC)
+	requirement := testRequirement(RouteCurrentPlatformHealth, EvidenceTypeCurrentPlatformState, CriticalityCritical, EvidenceSubject{Kind: SubjectHost, ID: "dell"}, &TemporalScope{Kind: TemporalNow, At: &now, Valid: true})
+	evidence := InvestigationEvidence{
+		Route:        InvestigationRoute{ID: RouteCurrentPlatformHealth, Resolution: RouteResolutionSupported, Frame: QuestionFrame{Subjects: []EvidenceSubject{requirement.Subject}, Temporal: *requirement.Window}},
+		Requirements: []EvidenceRequirement{requirement},
+		Sources:      []SourceRef{{ID: "source", Capability: "get_platform_overview", Subject: requirement.Subject, CollectedAt: now, Availability: AvailabilityAvailable}},
+	}
+	for index := 0; index <= evidencePacketMaxCriticalItems; index++ {
+		evidence.Items = append(evidence.Items, EvidenceItem{
+			ID: fmt.Sprintf("item-%d", index), Kind: EvidenceObserved, Type: requirement.Type, Subject: requirement.Subject, SourceID: "source",
+			Relevance: Relevance{RequirementID: requirement.ID, Criticality: CriticalityCritical},
+			Payload:   EvidencePayload{Fields: []EvidenceField{integerField("index", int64(index))}},
+		})
+	}
+	if _, err := BuildEvidencePacket(evidence); !errors.Is(err, errEvidencePacketTooLarge) {
+		t.Fatalf("critical cardinality error=%v", err)
+	}
+}
+
+func TestEvidencePacketRejectsIrreducibleCriticalFieldCardinality(t *testing.T) {
+	now := time.Date(2026, 9, 25, 18, 0, 0, 0, time.UTC)
+	requirement := testRequirement(RouteCurrentPlatformHealth, EvidenceTypeCurrentPlatformState, CriticalityCritical, EvidenceSubject{Kind: SubjectHost, ID: "dell"}, &TemporalScope{Kind: TemporalNow, At: &now, Valid: true})
+	fields := make([]EvidenceField, 0, evidencePacketMaxFieldsPerItem+1)
+	for index := 0; index <= evidencePacketMaxFieldsPerItem; index++ {
+		fields = append(fields, integerField(fmt.Sprintf("required_%02d", index), int64(index)))
+	}
+	evidence := InvestigationEvidence{
+		Route:        InvestigationRoute{ID: RouteCurrentPlatformHealth, Resolution: RouteResolutionSupported, Frame: QuestionFrame{Subjects: []EvidenceSubject{requirement.Subject}, Temporal: *requirement.Window}},
+		Requirements: []EvidenceRequirement{requirement},
+		Sources:      []SourceRef{{ID: "source", Capability: "get_platform_overview", Subject: requirement.Subject, CollectedAt: now, Availability: AvailabilityAvailable}},
+		Items: []EvidenceItem{{
+			ID: "item", Kind: EvidenceObserved, Type: requirement.Type, Subject: requirement.Subject, SourceID: "source",
+			Relevance: Relevance{RequirementID: requirement.ID, Criticality: CriticalityCritical}, Payload: EvidencePayload{Fields: fields},
+		}},
+	}
+	if _, err := BuildEvidencePacket(evidence); !errors.Is(err, errEvidencePacketTooLarge) {
+		t.Fatalf("critical field cardinality error=%v", err)
 	}
 }
 

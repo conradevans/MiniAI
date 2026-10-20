@@ -8,11 +8,13 @@ import (
 )
 
 type agentToolEvent struct {
-	RequestID string         `json:"request_id,omitempty"`
-	Phase     string         `json:"phase"`
-	Name      string         `json:"name"`
-	Arguments map[string]any `json:"arguments,omitempty"`
-	Summary   string         `json:"summary,omitempty"`
+	RequestID     string                `json:"request_id,omitempty"`
+	Phase         string                `json:"phase"`
+	Name          string                `json:"name"`
+	Arguments     map[string]any        `json:"arguments,omitempty"`
+	Summary       string                `json:"summary,omitempty"`
+	Availability  Availability          `json:"availability,omitempty"`
+	ErrorCategory EvidenceErrorCategory `json:"error_category,omitempty"`
 }
 
 func (a *app) handleAgentChatStream(w http.ResponseWriter, r *http.Request, req chatRequest, policy modelPolicy, history []storedMessage) {

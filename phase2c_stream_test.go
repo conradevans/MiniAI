@@ -1269,3 +1269,174 @@ func indexOf(values []string, wanted string) int {
 	}
 	return -1
 }
+
+func TestPhase2CFatalPacketErrorEmitsRealResultsAndSafeDiagnostics(t *testing.T) {
+	h := newPhase2CTestHarness(t, 12)
+	now := time.Date(2026, 9, 28, 5, 6, 47, 0, time.UTC)
+	h.app.phase2Now = func() time.Time { return now }
+	h.app.phase2Executor = productionApplicationIncidentExecutor(now)
+	h.app.phase2Reducer = irreduciblyOversizedApplicationEvidence
+
+	var logs bytes.Buffer
+	previousWriter := log.Writer()
+	previousFlags := log.Flags()
+	previousPrefix := log.Prefix()
+	log.SetOutput(&logs)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	t.Cleanup(func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+		log.SetPrefix(previousPrefix)
+	})
+
+	rr := httptest.NewRecorder()
+	capture := newSSECaptureWriter(rr)
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/chat/stream", nil)
+	if !h.app.handlePhase2CStream(capture, r, "Why has MyScheduler been failing recently?", nil) {
+		t.Fatal("Phase 2C request was not handled")
+	}
+	if got := len(h.reasonerRequests()); got != 0 {
+		t.Fatalf("fatal packet error invoked the reasoner %d times", got)
+	}
+	stream := rr.Body.String()
+	if !strings.Contains(stream, `"limitation":"packet_too_large"`) || !strings.Contains(stream, `"model_invoked":false`) || phase2CStreamAnswer(t, stream) != safeReasonerLimitation() {
+		t.Fatalf("fatal packet fallback=%s", stream)
+	}
+	events := phase2CToolEvents(t, stream)
+	starts, results := 0, 0
+	for _, event := range events {
+		switch event.Phase {
+		case "start":
+			starts++
+		case "result":
+			results++
+			if event.Availability != AvailabilityAvailable && event.Availability != AvailabilityPartial {
+				t.Fatalf("real availability lost: %+v", event)
+			}
+			if event.ErrorCategory == EvidenceErrorInternal || strings.Contains(event.Summary, "evidence unavailable (internal)") {
+				t.Fatalf("synthetic internal result emitted: %+v", event)
+			}
+		}
+	}
+	if starts != 5 || results != 5 {
+		t.Fatalf("tool event pairs=%d/%d events=%+v", starts, results, events)
+	}
+	reads := capture.capturedHistoryReads(HistoryStatusFailed)
+	if len(reads) != 5 {
+		t.Fatalf("history reads=%+v", reads)
+	}
+	for _, read := range reads {
+		if read.Status != "completed" || (read.Availability != string(AvailabilityAvailable) && read.Availability != string(AvailabilityPartial)) {
+			t.Fatalf("lifecycle/availability=%+v", read)
+		}
+	}
+	if capture.metadata.ErrorCategory != string(Phase2BPipelineErrorPacketTooLarge) {
+		t.Fatalf("history error category=%q", capture.metadata.ErrorCategory)
+	}
+	logged := logs.String()
+	for _, required := range []string{
+		"route=application_performance_investigation", "stage=packet_build", "category=packet_too_large",
+		"packet_bytes=", "packet_target=4096", "packet_limit=6144", "get_app_context:available",
+	} {
+		if !strings.Contains(logged, required) {
+			t.Fatalf("safe diagnostic missing %q: %s", required, logged)
+		}
+	}
+	if strings.Contains(logged, irreducibleEvidenceMarker) {
+		t.Fatalf("operator log leaked raw evidence: %s", logged)
+	}
+}
+
+func TestPhase2CPreReadFailuresReportZeroRoundsAndNoToolEvents(t *testing.T) {
+	now := time.Date(2026, 9, 28, 5, 6, 47, 0, time.UTC)
+	routerContext := ShadowRouterContext{
+		Now: now, Location: time.UTC,
+		Entities: []RouterEntity{{Subject: EvidenceSubject{Kind: SubjectApplication, ID: "myscheduler", Name: "MyScheduler"}, Aliases: []string{"myscheduler", "MyScheduler"}}},
+	}
+
+	t.Run("planning failure", func(t *testing.T) {
+		registry := phase0CapabilityRegistry()
+		for index := range registry.capabilities {
+			registry.capabilities[index].Metadata.CostUnits = phase2BMaxCostUnits + 1
+		}
+		pipeline := NewPhase2BPipeline(registry, nil, func() time.Time { return now })
+		prepared, err := pipeline.Prepare("Why has MyScheduler been failing recently?", routerContext)
+		if err == nil || prepared.Route.ID != RouteApplicationPerformance {
+			t.Fatalf("planning error/route=%v/%s", err, prepared.Route.ID)
+		}
+		rr := httptest.NewRecorder()
+		(&app{}).emitPhase2CLimitation(rr, prepared, Phase2BResult{}, now, "evidence_plan_invalid")
+		assertPhase2CZeroReadLimitation(t, rr.Body.String())
+	})
+
+	t.Run("global execution failure", func(t *testing.T) {
+		pipeline := NewPhase2BPipeline(phase0CapabilityRegistry(), nil, func() time.Time { return now })
+		prepared, err := pipeline.Prepare("Why has MyScheduler been failing recently?", routerContext)
+		if err != nil || len(prepared.Plan.Requests) != 5 {
+			t.Fatalf("prepared plan/error=%d/%v", len(prepared.Plan.Requests), err)
+		}
+		result, err := pipeline.ExecutePrepared(t.Context(), prepared)
+		if err == nil || len(result.Results) != 0 || result.EvidenceRounds != 0 {
+			t.Fatalf("execution error/results/rounds=%v/%d/%d", err, len(result.Results), result.EvidenceRounds)
+		}
+		rr := httptest.NewRecorder()
+		(&app{}).emitPhase2CLimitation(rr, prepared, result, now, phase2CPipelineLimitation(err))
+		assertPhase2CZeroReadLimitation(t, rr.Body.String())
+	})
+}
+
+func assertPhase2CZeroReadLimitation(t *testing.T, stream string) {
+	t.Helper()
+	if events := phase2CToolEvents(t, stream); len(events) != 0 {
+		t.Fatalf("pre-read failure emitted tool events: %+v stream=%s", events, stream)
+	}
+	if strings.Count(stream, `"evidence_rounds":0`) != 2 || strings.Count(stream, `"tool_calls":0`) != 2 || !strings.Contains(stream, `"model_invoked":false`) {
+		t.Fatalf("pre-read lifecycle metadata=%s", stream)
+	}
+}
+
+func TestPhase2CProductionApplicationIncidentReachesOneFakeReasonerCall(t *testing.T) {
+	h := newPhase2CTestHarness(t, 12)
+	now := time.Date(2026, 9, 28, 5, 6, 47, 0, time.UTC)
+	h.app.phase2Now = func() time.Time { return now }
+	h.app.phase2Executor = productionApplicationIncidentExecutor(now)
+
+	rr := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/chat/stream", nil)
+	if !h.app.handlePhase2CStream(rr, r, "Why has MyScheduler been failing recently?", nil) {
+		t.Fatal("Phase 2C request was not handled")
+	}
+	requests := h.reasonerRequests()
+	if len(requests) != 1 {
+		t.Fatalf("reasoner calls=%d stream=%s", len(requests), rr.Body.String())
+	}
+	packet, err := evidencePacketFromReasonerRequest(requests[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	packetJSON, err := MarshalEvidencePacket(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if packet.Route != RouteApplicationPerformance || len(packetJSON) > evidencePacketHardLimitBytes {
+		t.Fatalf("reasoner packet route/bytes=%s/%d", packet.Route, len(packetJSON))
+	}
+	stream := rr.Body.String()
+	if !strings.Contains(stream, `"reasoner_calls":1`) || !strings.Contains(stream, `"model_invoked":true`) || strings.Contains(stream, `"limitation":"evidence_pipeline_failed"`) {
+		t.Fatalf("production-shaped Phase 2C stream=%s", stream)
+	}
+	resultEvents := 0
+	for _, event := range phase2CToolEvents(t, stream) {
+		if event.Phase != "result" {
+			continue
+		}
+		resultEvents++
+		if event.Availability != AvailabilityAvailable && event.Availability != AvailabilityPartial {
+			t.Fatalf("result availability=%+v", event)
+		}
+	}
+	if resultEvents != 5 {
+		t.Fatalf("result events=%d", resultEvents)
+	}
+}

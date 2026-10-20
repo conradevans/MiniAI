@@ -85,3 +85,19 @@ func TestSSECaptureDoesNotInventEvidenceExecutionTimestamps(t *testing.T) {
 		t.Fatalf("SSE emission times were represented as execution times: %+v", reads)
 	}
 }
+
+func TestSSECaptureSeparatesCompletedLifecycleFromEvidenceAvailability(t *testing.T) {
+	capture := newSSECaptureWriter(httptest.NewRecorder())
+	sendSSE(capture, "tool", agentToolEvent{
+		RequestID: "request-timeout", Phase: "start", Name: "read_host_history",
+		Arguments: map[string]any{"range": "24h"},
+	})
+	sendSSE(capture, "tool", agentToolEvent{
+		RequestID: "request-timeout", Phase: "result", Name: "read_host_history",
+		Summary: "evidence unavailable (timeout)", Availability: AvailabilityUnavailable, ErrorCategory: EvidenceErrorTimeout,
+	})
+	reads := capture.capturedHistoryReads(HistoryStatusFailed)
+	if len(reads) != 1 || reads[0].Status != "completed" || reads[0].Availability != string(AvailabilityUnavailable) || reads[0].SafeSummary != "evidence unavailable (timeout)" {
+		t.Fatalf("lifecycle and availability were conflated: %+v", reads)
+	}
+}

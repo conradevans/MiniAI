@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -13,20 +12,43 @@ const evidencePacketSchemaVersion = "phase2b.packet.v1"
 var errEvidencePacketTooLarge = errors.New("phase2b critical evidence exceeds packet hard limit")
 
 type EvidencePacket struct {
-	SchemaVersion   string                     `json:"schemaVersion"`
-	Question        string                     `json:"question"`
-	Route           InvestigationRouteID       `json:"route"`
-	Goal            InvestigationGoal          `json:"goal"`
-	Subjects        []EvidenceSubject          `json:"subjects"`
-	Temporal        TemporalScope              `json:"temporal"`
-	Sources         []EvidencePacketSource     `json:"sources"`
-	Evidence        []EvidencePacketItem       `json:"evidence"`
-	Derivations     []EvidencePacketDerivation `json:"derivations,omitempty"`
-	Missing         []MissingEvidence          `json:"missing,omitempty"`
-	Conflicts       []EvidenceConflict         `json:"conflicts,omitempty"`
-	Confidence      ConfidenceDecision         `json:"confidence"`
-	Compacted       bool                       `json:"compacted"`
-	DroppedEvidence int                        `json:"droppedEvidence,omitempty"`
+	SchemaVersion   string                        `json:"schemaVersion"`
+	Route           InvestigationRouteID          `json:"route"`
+	Goal            InvestigationGoal             `json:"goal"`
+	Subjects        []EvidenceSubject             `json:"subjects"`
+	Temporal        TemporalScope                 `json:"temporal"`
+	Sources         []EvidencePacketSource        `json:"sources"`
+	Evidence        []EvidencePacketItem          `json:"evidence"`
+	Derivations     []EvidencePacketDerivation    `json:"derivations,omitempty"`
+	Missing         []MissingEvidence             `json:"missing,omitempty"`
+	MissingOmitted  EvidencePacketMissingOmission `json:"missingOmitted,omitzero"`
+	Conflicts       []EvidenceConflict            `json:"conflicts,omitempty"`
+	Confidence      EvidencePacketConfidence      `json:"confidence"`
+	Compacted       bool                          `json:"compacted"`
+	DroppedEvidence int                           `json:"droppedEvidence,omitempty"`
+}
+
+type EvidencePacketMissingOmission struct {
+	Critical   int `json:"critical,omitempty"`
+	Relevant   int `json:"relevant,omitempty"`
+	Supporting int `json:"supporting,omitempty"`
+}
+
+type EvidencePacketConfidence struct {
+	Level           ConfidenceLevel                `json:"level,omitempty"`
+	SoftwareCeiling ConfidenceLevel                `json:"softwareCeiling,omitempty"`
+	Inputs          EvidencePacketConfidenceInputs `json:"inputs"`
+	Reasons         []string                       `json:"reasons,omitempty"`
+}
+
+type EvidencePacketConfidenceInputs struct {
+	CriticalCompleteness CompletenessState  `json:"criticalCompleteness"`
+	Freshness            FreshnessState     `json:"freshness"`
+	Directness           EvidenceDirectness `json:"directness"`
+	Agreement            AgreementState     `json:"agreement"`
+	Coverage             CoverageState      `json:"coverage"`
+	RelevantTruncation   bool               `json:"relevantTruncation,omitempty"`
+	SubjectAmbiguity     bool               `json:"subjectAmbiguity,omitempty"`
 }
 
 type EvidencePacketSource struct {
@@ -35,14 +57,14 @@ type EvidencePacketSource struct {
 	Resource     string             `json:"resource,omitempty"`
 	CollectedAt  time.Time          `json:"collectedAt"`
 	Availability Availability       `json:"availability"`
-	Truncation   EvidenceTruncation `json:"truncation"`
+	Truncation   EvidenceTruncation `json:"truncation,omitzero"`
 }
 
 type EvidencePacketItem struct {
 	ID            string                 `json:"id"`
 	Kind          EvidenceKind           `json:"kind"`
 	Type          EvidenceType           `json:"type"`
-	Subject       EvidenceSubject        `json:"subject"`
+	Subject       EvidenceSubject        `json:"subject,omitzero"`
 	Timestamp     *time.Time             `json:"timestamp,omitempty"`
 	Window        *TemporalScope         `json:"window,omitempty"`
 	SourceID      string                 `json:"sourceId,omitempty"`
@@ -83,7 +105,6 @@ func BuildEvidencePacket(evidence InvestigationEvidence) (EvidencePacket, error)
 	}
 	packet := EvidencePacket{
 		SchemaVersion: evidencePacketSchemaVersion,
-		Question:      normalized.NormalizedQuestion,
 		Route:         normalized.Route.ID,
 		Goal:          normalized.Route.Frame.Goal,
 		Subjects:      append([]EvidenceSubject(nil), normalized.Route.Frame.Subjects...),
@@ -93,7 +114,17 @@ func BuildEvidencePacket(evidence InvestigationEvidence) (EvidencePacket, error)
 		Derivations:   make([]EvidencePacketDerivation, 0, len(normalized.Derivations)),
 		Missing:       append([]MissingEvidence(nil), normalized.Missing...),
 		Conflicts:     append([]EvidenceConflict(nil), normalized.Conflicts...),
-		Confidence:    normalized.Confidence,
+		Confidence: EvidencePacketConfidence{
+			Level: normalized.Confidence.Level, SoftwareCeiling: normalized.Confidence.SoftwareCeiling,
+			Inputs: EvidencePacketConfidenceInputs{
+				CriticalCompleteness: normalized.Confidence.Inputs.CriticalCompleteness,
+				Freshness:            normalized.Confidence.Inputs.Freshness, Directness: normalized.Confidence.Inputs.Directness,
+				Agreement: normalized.Confidence.Inputs.Agreement, Coverage: normalized.Confidence.Inputs.Coverage,
+				RelevantTruncation: normalized.Confidence.Inputs.RelevantTruncation,
+				SubjectAmbiguity:   normalized.Confidence.Inputs.SubjectAmbiguity,
+			},
+			Reasons: append([]string(nil), normalized.Confidence.Reasons...),
+		},
 	}
 	for _, source := range normalized.Sources {
 		packet.Sources = append(packet.Sources, EvidencePacketSource{
@@ -114,8 +145,11 @@ func BuildEvidencePacket(evidence InvestigationEvidence) (EvidencePacket, error)
 			OutputID: derivation.OutputID, Explanation: derivation.Explanation,
 		})
 	}
+	if err := projectEvidencePacket(&packet); err != nil {
+		return EvidencePacket{}, err
+	}
 	canonicalizeEvidencePacket(&packet)
-	encoded, err := json.Marshal(packet)
+	encoded, err := marshalEvidencePacketJSON(packet)
 	if err != nil {
 		return EvidencePacket{}, err
 	}
@@ -123,28 +157,11 @@ func BuildEvidencePacket(evidence InvestigationEvidence) (EvidencePacket, error)
 		return packet, nil
 	}
 
-	packet.Compacted = true
-	protected := packetProtectedEvidenceIDs(packet)
-	for _, criticality := range []RequirementCriticality{CriticalitySupporting, CriticalityRelevant} {
-		for {
-			index := packetRemovalCandidate(packet.Evidence, protected, criticality)
-			if index < 0 {
-				break
-			}
-			packet.Evidence = append(packet.Evidence[:index], packet.Evidence[index+1:]...)
-			packet.DroppedEvidence++
-			pruneEvidencePacketReferences(&packet)
-			encoded, err = json.Marshal(packet)
-			if err != nil {
-				return EvidencePacket{}, err
-			}
-			if len(encoded) <= evidencePacketTargetBytes {
-				return packet, nil
-			}
-		}
+	if err := compactEvidencePacketToTarget(&packet); err != nil {
+		return EvidencePacket{}, err
 	}
 	pruneEvidencePacketReferences(&packet)
-	encoded, err = json.Marshal(packet)
+	encoded, err = marshalEvidencePacketJSON(packet)
 	if err != nil {
 		return EvidencePacket{}, err
 	}
@@ -156,7 +173,7 @@ func BuildEvidencePacket(evidence InvestigationEvidence) (EvidencePacket, error)
 
 func MarshalEvidencePacket(packet EvidencePacket) ([]byte, error) {
 	canonicalizeEvidencePacket(&packet)
-	encoded, err := json.Marshal(packet)
+	encoded, err := marshalEvidencePacketJSON(packet)
 	if err != nil {
 		return nil, err
 	}
@@ -205,11 +222,20 @@ func packetProtectedEvidenceIDs(packet EvidencePacket) map[string]bool {
 		}
 	}
 	for _, item := range packet.Evidence {
-		if packetConfidenceLimitingItem(item) || packetMaterialItem(packet.Route, item) {
+		if (packetConfidenceLimitingItem(item) && !packetRequirementHasLimitation(packet, item.RequirementID)) || packetMaterialItem(packet.Route, item) {
 			protected[item.ID] = true
 		}
 	}
 	return protected
+}
+
+func packetRequirementHasLimitation(packet EvidencePacket, requirementID string) bool {
+	for _, missing := range packet.Missing {
+		if missing.RequirementID == requirementID {
+			return true
+		}
+	}
+	return false
 }
 
 func packetMaterialDerivation(operation string) bool {
