@@ -1,190 +1,109 @@
 package main
 
 import (
-	"strings"
+	"errors"
 	"testing"
 )
 
-func TestAuthorizationPolicyAllowsReadsWithoutConfirmation(t *testing.T) {
-	decision := evaluateActionAuthorization(actionAuthorizationRequest{
-		CapabilityKind:      capabilityKindRead,
-		UndoMode:            undoModeNone,
-		AuthorizationSource: authorizationFromUntrustedData,
-	})
-	if !decision.Authorized || decision.ConfirmationRequired || decision.WarningRequired {
-		t.Fatalf("read decision=%+v", decision)
-	}
-}
-
-func TestAuthorizationPolicyAcceptsDirectAdminAuthorizationForRestorableActions(t *testing.T) {
+func TestPhase4ActionConfirmationPolicyMatrix(t *testing.T) {
 	tests := []struct {
-		name          string
-		undo          undoMode
-		recoveryPoint recoveryPointStatus
+		name             string
+		origin           ActionOrigin
+		safetyClass      ActionSafetyClass
+		wantConfirmation bool
+		wantWarning      bool
+		wantState        ActionState
 	}{
-		{name: "reversible", undo: undoModeReversible, recoveryPoint: recoveryPointNotRequired},
-		{name: "recoverable", undo: undoModeRecoverable, recoveryPoint: recoveryPointReady},
+		{
+			name: "direct user reversible", origin: ActionOriginDirectUser,
+			safetyClass: ActionSafetyReversible, wantState: ActionStateAuthorized,
+		},
+		{
+			name: "direct user recoverable", origin: ActionOriginDirectUser,
+			safetyClass: ActionSafetyRecoverable, wantState: ActionStateAuthorized,
+		},
+		{
+			name: "direct user compensatable", origin: ActionOriginDirectUser,
+			safetyClass: ActionSafetyCompensatable, wantConfirmation: true,
+			wantState: ActionStateAwaitingConfirmation,
+		},
+		{
+			name: "direct user irreversible", origin: ActionOriginDirectUser,
+			safetyClass: ActionSafetyIrreversible, wantConfirmation: true,
+			wantWarning: true, wantState: ActionStateAwaitingConfirmation,
+		},
+		{
+			name:   "assistant suggested reversible",
+			origin: ActionOriginAssistantSuggested, safetyClass: ActionSafetyReversible,
+			wantConfirmation: true, wantState: ActionStateAwaitingConfirmation,
+		},
+		{
+			name:   "assistant suggested recoverable",
+			origin: ActionOriginAssistantSuggested, safetyClass: ActionSafetyRecoverable,
+			wantConfirmation: true, wantState: ActionStateAwaitingConfirmation,
+		},
+		{
+			name:   "assistant suggested compensatable",
+			origin: ActionOriginAssistantSuggested, safetyClass: ActionSafetyCompensatable,
+			wantConfirmation: true, wantState: ActionStateAwaitingConfirmation,
+		},
+		{
+			name:   "assistant suggested irreversible",
+			origin: ActionOriginAssistantSuggested, safetyClass: ActionSafetyIrreversible,
+			wantConfirmation: true, wantWarning: true,
+			wantState: ActionStateAwaitingConfirmation,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			decision := evaluateActionAuthorization(actionAuthorizationRequest{
-				CapabilityKind:      capabilityKindAction,
-				UndoMode:            test.undo,
-				Initiator:           actionInitiatedByAdmin,
-				AuthorizationSource: authorizationFromAdmin,
-				RecoveryPoint:       test.recoveryPoint,
-			})
-			if !decision.Authorized || decision.ConfirmationRequired || !decision.AuditRequired {
+			decision, err := evaluateActionConfirmationPolicy(
+				test.origin,
+				test.safetyClass,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decision.ConfirmationRequired != test.wantConfirmation ||
+				decision.WarningRequired != test.wantWarning ||
+				decision.InitialState != test.wantState ||
+				decision.Reason == "" {
 				t.Fatalf("decision=%+v", decision)
 			}
 		})
 	}
 }
 
-func TestAuthorizationPolicyRequiresConfirmationForAssistantSuggestedAction(t *testing.T) {
-	request := actionAuthorizationRequest{
-		CapabilityKind:      capabilityKindAction,
-		UndoMode:            undoModeReversible,
-		Initiator:           actionInitiatedByAssistant,
-		AuthorizationSource: authorizationFromAdmin,
+func TestPhase4ActionConfirmationPolicyRejectsInvalidEnums(t *testing.T) {
+	if _, err := evaluateActionConfirmationPolicy(
+		ActionOrigin("model_claimed"),
+		ActionSafetyRecoverable,
+	); !errors.Is(err, errInvalidActionOrigin) {
+		t.Fatalf("invalid origin error=%v", err)
 	}
-	decision := evaluateActionAuthorization(request)
-	if decision.Authorized || !decision.ConfirmationRequired {
-		t.Fatalf("unconfirmed decision=%+v", decision)
-	}
-	request.AdminConfirmed = true
-	decision = evaluateActionAuthorization(request)
-	if !decision.Authorized {
-		t.Fatalf("confirmed decision=%+v", decision)
+	if _, err := evaluateActionConfirmationPolicy(
+		ActionOriginDirectUser,
+		ActionSafetyClass("low_risk"),
+	); !errors.Is(err, errInvalidActionSafetyClass) {
+		t.Fatalf("invalid safety class error=%v", err)
 	}
 }
 
-func TestAuthorizationPolicySequencesAssistantRecoverableConfirmationBeforeRecoveryPoint(t *testing.T) {
-	request := actionAuthorizationRequest{
-		CapabilityKind:      capabilityKindAction,
-		UndoMode:            undoModeRecoverable,
-		Initiator:           actionInitiatedByAssistant,
-		AuthorizationSource: authorizationFromAdmin,
-		RecoveryPoint:       recoveryPointNotRequired,
+func TestPhase4ActionConfirmationPolicyIsDeterministic(t *testing.T) {
+	first, err := evaluateActionConfirmationPolicy(
+		ActionOriginAssistantSuggested,
+		ActionSafetyRecoverable,
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	decision := evaluateActionAuthorization(request)
-	if decision.Authorized || !decision.ConfirmationRequired || decision.RecoveryPointRequired {
-		t.Fatalf("unconfirmed decision=%+v", decision)
+	second, err := evaluateActionConfirmationPolicy(
+		ActionOriginAssistantSuggested,
+		ActionSafetyRecoverable,
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(decision.Reason, "admin confirmation") || strings.Contains(decision.Reason, "must be created") {
-		t.Fatalf("unconfirmed reason=%q", decision.Reason)
-	}
-
-	request.AdminConfirmed = true
-	decision = evaluateActionAuthorization(request)
-	if decision.Authorized || decision.ConfirmationRequired || !decision.RecoveryPointRequired {
-		t.Fatalf("confirmed without recovery point decision=%+v", decision)
-	}
-
-	request.RecoveryPoint = recoveryPointReady
-	decision = evaluateActionAuthorization(request)
-	if !decision.Authorized {
-		t.Fatalf("confirmed with ready recovery point decision=%+v", decision)
-	}
-}
-
-func TestAuthorizationPolicyRequiresWarningAndSecondConfirmationForNonRestorableActions(t *testing.T) {
-	for _, undo := range []undoMode{undoModeCompensatable, undoModeIrreversible} {
-		t.Run(string(undo), func(t *testing.T) {
-			request := actionAuthorizationRequest{
-				CapabilityKind:      capabilityKindAction,
-				UndoMode:            undo,
-				Initiator:           actionInitiatedByAdmin,
-				AuthorizationSource: authorizationFromAdmin,
-			}
-			decision := evaluateActionAuthorization(request)
-			if decision.Authorized || !decision.WarningRequired || !decision.ConfirmationRequired {
-				t.Fatalf("without warning decision=%+v", decision)
-			}
-
-			request.NonRestorabilityWarning = "The original state cannot be exactly restored."
-			decision = evaluateActionAuthorization(request)
-			if decision.Authorized {
-				t.Fatalf("warning without second confirmation decision=%+v", decision)
-			}
-
-			request.AdminConfirmedAfterWarning = true
-			decision = evaluateActionAuthorization(request)
-			if !decision.Authorized || !decision.WarningRequired || !decision.ConfirmationRequired {
-				t.Fatalf("warned and confirmed decision=%+v", decision)
-			}
-		})
-	}
-}
-
-func TestAuthorizationPolicyRejectsUntrustedAuthorization(t *testing.T) {
-	decision := evaluateActionAuthorization(actionAuthorizationRequest{
-		CapabilityKind:             capabilityKindAction,
-		UndoMode:                   undoModeIrreversible,
-		Initiator:                  actionInitiatedByAdmin,
-		AuthorizationSource:        authorizationFromUntrustedData,
-		AdminConfirmed:             true,
-		NonRestorabilityWarning:    "This cannot be restored.",
-		AdminConfirmedAfterWarning: true,
-	})
-	if decision.Authorized {
-		t.Fatalf("untrusted authorization decision=%+v", decision)
-	}
-}
-
-func TestAuthorizationPolicyDirectAdminRecoverableRequiresReadyRecoveryPoint(t *testing.T) {
-	tests := []struct {
-		name           string
-		status         recoveryPointStatus
-		wantAuthorized bool
-	}{
-		{name: "not ready", status: recoveryPointNotRequired},
-		{name: "failed", status: recoveryPointFailed},
-		{name: "ready", status: recoveryPointReady, wantAuthorized: true},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			decision := evaluateActionAuthorization(actionAuthorizationRequest{
-				CapabilityKind:      capabilityKindAction,
-				UndoMode:            undoModeRecoverable,
-				Initiator:           actionInitiatedByAdmin,
-				AuthorizationSource: authorizationFromAdmin,
-				RecoveryPoint:       test.status,
-			})
-			if decision.Authorized != test.wantAuthorized || !decision.RecoveryPointRequired {
-				t.Fatalf("decision=%+v want_authorized=%v", decision, test.wantAuthorized)
-			}
-		})
-	}
-}
-
-func TestAuthorizationPolicyRecoveryPointFailureNeverAuthorizes(t *testing.T) {
-	for _, initiator := range []actionInitiator{actionInitiatedByAdmin, actionInitiatedByAssistant} {
-		t.Run(string(initiator), func(t *testing.T) {
-			decision := evaluateActionAuthorization(actionAuthorizationRequest{
-				CapabilityKind:      capabilityKindAction,
-				UndoMode:            undoModeRecoverable,
-				Initiator:           initiator,
-				AuthorizationSource: authorizationFromAdmin,
-				AdminConfirmed:      true,
-				RecoveryPoint:       recoveryPointFailed,
-			})
-			if decision.Authorized || !decision.RecoveryPointRequired {
-				t.Fatalf("decision=%+v", decision)
-			}
-		})
-	}
-}
-
-func TestAuthorizationPolicyRequiresDeclaredUndoModeForActions(t *testing.T) {
-	decision := evaluateActionAuthorization(actionAuthorizationRequest{
-		CapabilityKind:      capabilityKindAction,
-		UndoMode:            undoModeNone,
-		Initiator:           actionInitiatedByAdmin,
-		AuthorizationSource: authorizationFromAdmin,
-	})
-	if decision.Authorized {
-		t.Fatalf("decision=%+v", decision)
+	if first != second {
+		t.Fatalf("same inputs produced different decisions: first=%+v second=%+v", first, second)
 	}
 }
