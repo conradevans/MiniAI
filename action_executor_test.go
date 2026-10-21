@@ -79,7 +79,7 @@ func TestRestartApplicationExecutorSucceedsOnceWithValidatedTarget(t *testing.T)
 
 		t.Fatalf("execution events=%+v", events)
 	}
-	assertActionDoesNotSupportExecution(t, ActionKindRestartApplication)
+	assertActionSupportsExecution(t, ActionKindRestartApplication, true)
 }
 
 func TestRestartApplicationExecutorRejectsEveryUnauthorizedShape(t *testing.T) {

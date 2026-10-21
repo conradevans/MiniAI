@@ -233,7 +233,7 @@ func LookupDefinition(kind ActionKind) (ActionDefinition, bool) {
 			Kind:                ActionKindRestartApplication,
 			SafetyClass:         ActionSafetyRecoverable,
 			TargetType:          ActionTargetApplication,
-			SupportsExecution:   false,
+			SupportsExecution:   true,
 			executionFoundation: actionExecutionFoundationRestartApplication,
 		}, true
 	case ActionKindRollbackDeployment:
@@ -423,14 +423,15 @@ func ValidActionSafetyClass(safetyClass ActionSafetyClass) bool {
 
 // ValidateRestartExecutionFoundation revalidates the complete opaque proposal
 // against the closed catalog before the restart-specific executor may begin.
-// The foundation permit is intentionally separate from SupportsExecution:
-// Phase 4B1 provides no API or automatic path that can execute an action.
+// The closed foundation permit and public SupportsExecution policy must both
+// authorize the narrowly typed restart path.
 func ValidateRestartExecutionFoundation(proposal Proposal) error {
 	if _, err := EvaluateProposal(proposal); err != nil {
 		return err
 	}
 	definition, ok := LookupDefinition(proposal.kind)
 	if !ok || definition.executionFoundation != actionExecutionFoundationRestartApplication ||
+		!definition.SupportsExecution ||
 		proposal.kind != ActionKindRestartApplication ||
 		definition.TargetType != ActionTargetApplication ||
 		proposal.target.Type != ActionTargetApplication {
@@ -446,6 +447,10 @@ func ValidateRestartExecutionFoundation(proposal Proposal) error {
 func supportsRestoredExecutionState(kind ActionKind) bool {
 	definition, ok := LookupDefinition(kind)
 	return ok && definition.executionFoundation == actionExecutionFoundationRestartApplication
+}
+
+func ValidActionID(id ActionID) bool {
+	return actionIDPattern.MatchString(string(id))
 }
 
 func ValidApplicationTargetID(id string) bool {

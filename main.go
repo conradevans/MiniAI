@@ -214,6 +214,12 @@ func main() {
 		sessions:          make(map[string]*session),
 	}
 
+	restartClient, err := newMiniDeployRestartClient(a.minideployURL, a.client)
+	if err != nil {
+		log.Fatalf("configure MiniDeploy restart client: %v", err)
+	}
+	restartExecutor := newRestartApplicationExecutor(store, restartClient)
+
 	adminBoundary, err := newAdminSecurityBoundary(adminAuthConfigFromEnvironment())
 	if err != nil {
 		log.Printf("MiniAI administrator routes disabled: authentication configuration unavailable")
@@ -242,7 +248,7 @@ func main() {
 	mux.HandleFunc("POST /api/v1/session/{id}/heartbeat", a.handleHeartbeat)
 	mux.HandleFunc("DELETE /api/v1/session/{id}", a.handleDeleteSession)
 	mux.HandleFunc("POST /api/v1/chat/stream", a.handleChatStream)
-	a.registerAdminActionRoutes(mux)
+	a.registerAdminActionRoutes(mux, restartExecutor)
 	a.registerWebRoutes(mux)
 
 	go a.reaper()

@@ -7,20 +7,21 @@ import (
 	"time"
 )
 
-func TestPhase4ActionCatalogIsClosedAndNonExecutable(t *testing.T) {
+func TestPhase4ActionCatalogIsClosedAndExecutionIsRestartOnly(t *testing.T) {
 	catalog := phase4ActionCatalog()
 	if catalogType := reflect.TypeOf(catalog); catalogType.NumField() != 0 {
 		t.Fatalf("action catalog exposes mutable fields: %v", catalogType)
 	}
 
 	want := []struct {
-		kind        ActionKind
-		safetyClass ActionSafetyClass
-		targetType  ActionTargetType
+		kind              ActionKind
+		safetyClass       ActionSafetyClass
+		targetType        ActionTargetType
+		supportsExecution bool
 	}{
 		{
 			kind: ActionKindRestartApplication, safetyClass: ActionSafetyRecoverable,
-			targetType: ActionTargetApplication,
+			targetType: ActionTargetApplication, supportsExecution: true,
 		},
 		{
 			kind: ActionKindRollbackDeployment, safetyClass: ActionSafetyIrreversible,
@@ -40,7 +41,7 @@ func TestPhase4ActionCatalogIsClosedAndNonExecutable(t *testing.T) {
 		if definition.Kind != expected.kind ||
 			definition.SafetyClass != expected.safetyClass ||
 			definition.TargetType != expected.targetType ||
-			definition.SupportsExecution {
+			definition.SupportsExecution != expected.supportsExecution {
 
 			t.Fatalf("definition %d=%+v want=%+v", index, definition, expected)
 		}
@@ -57,7 +58,7 @@ func TestPhase4ActionCatalogIsClosedAndNonExecutable(t *testing.T) {
 		definition.Kind != ActionKindRestartApplication ||
 		definition.SafetyClass != ActionSafetyRecoverable ||
 		definition.TargetType != ActionTargetApplication ||
-		definition.SupportsExecution {
+		!definition.SupportsExecution {
 
 		t.Fatalf("returned copy modified authoritative catalog: %+v", definition)
 	}
@@ -666,11 +667,12 @@ func TestPhase4ActionLifecycleAcceptsOnlyDefinedTransitions(t *testing.T) {
 	}
 }
 
-func TestPhase4ActionProposalCreationIsPureAndNonExecutable(t *testing.T) {
+func TestPhase4ActionProposalCreationIsPureAndHasClosedExecutionPolicy(t *testing.T) {
 	catalog := phase4ActionCatalog()
 	for _, definition := range catalog.definitionsCopy() {
-		if definition.SupportsExecution {
-			t.Fatalf("action %q unexpectedly supports execution", definition.Kind)
+		wantExecution := definition.Kind == ActionKindRestartApplication
+		if definition.SupportsExecution != wantExecution {
+			t.Fatalf("action %q execution support=%t want=%t", definition.Kind, definition.SupportsExecution, wantExecution)
 		}
 	}
 	input := ActionProposalInput{

@@ -37,9 +37,10 @@ type actionProposalCreateInput struct {
 }
 
 type storedActionProposal struct {
-	Proposal       ActionProposal
-	HistoryEntryID string
-	UpdatedAt      time.Time
+	Proposal          ActionProposal
+	HistoryEntryID    string
+	SupportsExecution bool
+	UpdatedAt         time.Time
 }
 
 type ActionEvent struct {
@@ -173,9 +174,10 @@ func (s *chatStore) createActionProposal(
 		return storedActionProposal{}, err
 	}
 	return storedActionProposal{
-		Proposal:       proposal,
-		HistoryEntryID: input.HistoryEntryID,
-		UpdatedAt:      input.CreatedAt,
+		Proposal:          proposal,
+		HistoryEntryID:    input.HistoryEntryID,
+		SupportsExecution: definition.SupportsExecution,
+		UpdatedAt:         input.CreatedAt,
 	}, nil
 }
 
@@ -425,7 +427,7 @@ func loadActionProposal(
 	}
 	if ActionSafetyClass(safetyClass) != definition.SafetyClass ||
 		ActionTargetType(targetType) != definition.TargetType ||
-		supportsExecution != definition.SupportsExecution {
+		!validStoredActionExecutionPolicy(ActionKind(kind), supportsExecution, definition) {
 
 		return storedActionProposal{}, nil, invalidPersistedAction(
 			errors.New("stored catalog metadata does not match authoritative definition"),
@@ -496,10 +498,26 @@ func loadActionProposal(
 		)
 	}
 	return storedActionProposal{
-		Proposal:       proposal,
-		HistoryEntryID: historyEntryID.String,
-		UpdatedAt:      updatedAt,
+		Proposal:          proposal,
+		HistoryEntryID:    historyEntryID.String,
+		SupportsExecution: supportsExecution,
+		UpdatedAt:         updatedAt,
 	}, events, nil
+}
+
+// validStoredActionExecutionPolicy keeps pre-4B2 restart proposals readable
+// without granting them the execution authority added in 4B2. A persisted
+// true value can never override an authoritative catalog denial.
+func validStoredActionExecutionPolicy(
+	kind ActionKind,
+	stored bool,
+	definition ActionDefinition,
+) bool {
+	if stored {
+		return definition.SupportsExecution
+	}
+	return !definition.SupportsExecution ||
+		(kind == ActionKindRestartApplication && definition.SupportsExecution)
 }
 
 func loadActionEvents(

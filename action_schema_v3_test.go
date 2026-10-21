@@ -116,7 +116,7 @@ func TestActionSchemaV3MigratesV2RecordsWithoutDataLoss(t *testing.T) {
 		t.Fatal(err)
 	}
 	if record.Proposal.State() != ActionStateAuthorized ||
-		record.Proposal.Target().ID != "myscheduler" {
+		record.Proposal.Target().ID != "myscheduler" || record.SupportsExecution {
 
 		t.Fatalf("migrated proposal=%+v", record)
 	}
@@ -400,6 +400,9 @@ func TestActionSchemaV3MigratesRealisticPopulatedV2Database(t *testing.T) {
 		}
 		if record.Proposal.State() != state {
 			t.Fatalf("restored %s state=%q want=%q", id, record.Proposal.State(), state)
+		}
+		if record.SupportsExecution {
+			t.Fatalf("migrated pre-4B2 action %s gained execution support", id)
 		}
 	}
 	cancelled, err := migrated.getActionProposal(ActionID(expectedActions[1].ActionID))

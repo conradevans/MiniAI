@@ -31,7 +31,10 @@ func TestActionPersistenceDirectRestartUsesPolicyAuthorizationAudit(t *testing.T
 			created.Proposal.Origin(), created.Proposal.SafetyClass(), created.Proposal.State(),
 			created.Proposal.ConfirmationRequired(), created.Proposal.WarningRequired())
 	}
-	assertActionDoesNotSupportExecution(t, created.Proposal.Kind())
+	assertActionSupportsExecution(t, created.Proposal.Kind(), true)
+	if !created.SupportsExecution {
+		t.Fatal("new restart did not persist execution support")
+	}
 	events, err := store.listActionEvents(created.Proposal.ID())
 	if err != nil {
 		t.Fatal(err)
@@ -183,7 +186,7 @@ func TestActionPersistenceReopenAndTypedDeployArguments(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertActionEventTypes(t, events, ActionEventProposalCreated)
-	assertActionDoesNotSupportExecution(t, loaded.Proposal.Kind())
+	assertActionSupportsExecution(t, loaded.Proposal.Kind(), false)
 }
 
 func TestActionPersistenceRejectsTamperedRecords(t *testing.T) {
@@ -269,7 +272,7 @@ func TestActionPersistenceRejectsTamperedRecords(t *testing.T) {
 		{
 			name: "tampered execution support",
 			create: func(t *testing.T, store *chatStore) storedActionProposal {
-				return mustCreateRestart(t, store, ActionOriginDirectUser)
+				return mustCreateRollback(t, store, ActionOriginDirectUser, "")
 			},
 			mutate: func(t *testing.T, store *chatStore, id ActionID) {
 				execActionTestSQL(t, store, `UPDATE action_proposals SET supports_execution = 1 WHERE action_id = ?`, id)
@@ -747,11 +750,11 @@ func assertActionEventTypes(
 	}
 }
 
-func assertActionDoesNotSupportExecution(t *testing.T, kind ActionKind) {
+func assertActionSupportsExecution(t *testing.T, kind ActionKind, want bool) {
 	t.Helper()
 	definition, ok := phase4ActionCatalog().lookup(kind)
-	if !ok || definition.SupportsExecution {
-		t.Fatalf("action %q execution support=%t found=%t", kind, definition.SupportsExecution, ok)
+	if !ok || definition.SupportsExecution != want {
+		t.Fatalf("action %q execution support=%t want=%t found=%t", kind, definition.SupportsExecution, want, ok)
 	}
 }
 

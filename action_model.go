@@ -108,3 +108,7 @@ func transitionActionProposal(
 ) (ActionProposal, error) {
 	return actiondomain.TransitionProposal(proposal, to)
 }
+
+func validActionID(id ActionID) bool {
+	return actiondomain.ValidActionID(id)
+}

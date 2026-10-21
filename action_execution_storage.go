@@ -38,6 +38,7 @@ func (s *chatStore) beginRestartApplicationExecution(
 		return storedActionProposal{}, err
 	}
 	if err := actiondomain.ValidateRestartExecutionFoundation(record.Proposal); err != nil ||
+		!record.SupportsExecution ||
 		record.Proposal.State() != ActionStateAuthorized ||
 		!sameRestartExecutionProposal(proposal, record.Proposal) {
 
@@ -103,6 +104,7 @@ func (s *chatStore) completeRestartApplicationSuccess(
 		return storedActionProposal{}, err
 	}
 	if err := actiondomain.ValidateRestartExecutionFoundation(record.Proposal); err != nil ||
+		!record.SupportsExecution ||
 		record.Proposal.State() != ActionStateExecuting {
 
 		return storedActionProposal{}, fmt.Errorf(
@@ -178,6 +180,7 @@ func (s *chatStore) completeRestartApplicationFailure(
 		return storedActionProposal{}, err
 	}
 	if err := actiondomain.ValidateRestartExecutionFoundation(record.Proposal); err != nil ||
+		!record.SupportsExecution ||
 		record.Proposal.State() != ActionStateExecuting {
 
 		return storedActionProposal{}, fmt.Errorf(

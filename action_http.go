@@ -31,28 +31,31 @@ type adminActionTargetResponse struct {
 }
 
 type adminActionResponse struct {
-	ActionID             ActionID                  `json:"action_id"`
-	Kind                 ActionKind                `json:"kind"`
-	Origin               ActionOrigin              `json:"origin"`
-	SafetyClass          ActionSafetyClass         `json:"safety_class"`
-	Target               adminActionTargetResponse `json:"target"`
-	Arguments            any                       `json:"arguments"`
-	State                ActionState               `json:"state"`
-	ConfirmationRequired bool                      `json:"confirmation_required"`
-	WarningRequired      bool                      `json:"warning_required"`
-	SupportsExecution    bool                      `json:"supports_execution"`
-	CreatedAt            time.Time                 `json:"created_at"`
-	UpdatedAt            time.Time                 `json:"updated_at"`
-	HistoryEntryID       string                    `json:"history_id,omitempty"`
+	ActionID             ActionID                           `json:"action_id"`
+	Kind                 ActionKind                         `json:"kind"`
+	Origin               ActionOrigin                       `json:"origin"`
+	SafetyClass          ActionSafetyClass                  `json:"safety_class"`
+	Target               adminActionTargetResponse          `json:"target"`
+	Arguments            any                                `json:"arguments"`
+	State                ActionState                        `json:"state"`
+	ConfirmationRequired bool                               `json:"confirmation_required"`
+	WarningRequired      bool                               `json:"warning_required"`
+	SupportsExecution    bool                               `json:"supports_execution"`
+	ExecutionOutcome     RestartApplicationExecutionOutcome `json:"execution_outcome,omitempty"`
+	FailureCategory      ActionExecutionFailureCategory     `json:"failure_category,omitempty"`
+	CreatedAt            time.Time                          `json:"created_at"`
+	UpdatedAt            time.Time                          `json:"updated_at"`
+	HistoryEntryID       string                             `json:"history_id,omitempty"`
 }
 
 type adminActionEventResponse struct {
-	EventID   string          `json:"event_id"`
-	EventType ActionEventType `json:"event_type"`
-	FromState *ActionState    `json:"from_state"`
-	ToState   ActionState     `json:"to_state"`
-	Ordinal   int             `json:"ordinal"`
-	Timestamp time.Time       `json:"timestamp"`
+	EventID         string                         `json:"event_id"`
+	EventType       ActionEventType                `json:"event_type"`
+	FromState       *ActionState                   `json:"from_state"`
+	ToState         ActionState                    `json:"to_state"`
+	Ordinal         int                            `json:"ordinal"`
+	Timestamp       time.Time                      `json:"timestamp"`
+	FailureCategory ActionExecutionFailureCategory `json:"failure_category,omitempty"`
 }
 
 type adminActionEventsResponse struct {
@@ -60,12 +63,16 @@ type adminActionEventsResponse struct {
 	Events   []adminActionEventResponse `json:"events"`
 }
 
-func (a *app) registerAdminActionRoutes(mux *http.ServeMux) {
+func (a *app) registerAdminActionRoutes(
+	mux *http.ServeMux,
+	restartExecutor RestartApplicationExecutor,
+) {
 	mux.HandleFunc("POST /api/admin/actions", a.handleCreateAdminAction)
 	mux.HandleFunc("GET /api/admin/actions/{action_id}", a.handleGetAdminAction)
 	mux.HandleFunc("GET /api/admin/actions/{action_id}/events", a.handleGetAdminActionEvents)
 	mux.HandleFunc("POST /api/admin/actions/{action_id}/confirm", a.handleConfirmAdminAction)
 	mux.HandleFunc("POST /api/admin/actions/{action_id}/cancel", a.handleCancelAdminAction)
+	mux.HandleFunc("POST /api/admin/actions/{action_id}/execute", a.handleExecuteAdminRestart(restartExecutor))
 }
 
 func (a *app) handleCreateAdminAction(w http.ResponseWriter, r *http.Request) {
@@ -130,12 +137,13 @@ func (a *app) handleGetAdminActionEvents(w http.ResponseWriter, r *http.Request)
 	}
 	for _, event := range events {
 		response.Events = append(response.Events, adminActionEventResponse{
-			EventID:   event.ID,
-			EventType: event.Type,
-			FromState: event.FromState,
-			ToState:   event.ToState,
-			Ordinal:   event.Ordinal,
-			Timestamp: event.CreatedAt.UTC(),
+			EventID:         event.ID,
+			EventType:       event.Type,
+			FromState:       event.FromState,
+			ToState:         event.ToState,
+			Ordinal:         event.Ordinal,
+			Timestamp:       event.CreatedAt.UTC(),
+			FailureCategory: event.FailureCategory,
 		})
 	}
 	writeJSON(w, http.StatusOK, response)
@@ -197,6 +205,72 @@ func (a *app) handleCancelAdminAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+func (a *app) handleExecuteAdminRestart(
+	executor RestartApplicationExecutor,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := ActionID(r.PathValue("action_id"))
+		expectedPath := "/api/admin/actions/" + string(id) + "/execute"
+		if !validActionID(id) ||
+			r.URL.Path != expectedPath ||
+			r.URL.EscapedPath() != expectedPath ||
+			r.URL.RawQuery != "" ||
+			r.URL.ForceQuery {
+
+			writeError(w, http.StatusBadRequest, "invalid action execution request")
+			return
+		}
+		if err := requireEmptyAdminActionBody(w, r); err != nil {
+			writeError(w, http.StatusBadRequest, "execution request body must be empty")
+			return
+		}
+
+		record, err := a.store.getActionProposal(id)
+		if err != nil {
+			writeAdminActionLoadError(w, err)
+			return
+		}
+		result, executionErr := executor.Execute(r.Context(), record.Proposal)
+		switch result.Outcome {
+		case RestartApplicationExecutionSucceeded:
+			if executionErr != nil {
+				writeError(w, http.StatusInternalServerError, "could not record action execution")
+				return
+			}
+			writeAdminActionExecutionResponse(w, http.StatusOK, result)
+		case RestartApplicationExecutionFailed:
+			if !errors.Is(executionErr, errRestartApplicationExecutionFailed) {
+				writeError(w, http.StatusInternalServerError, "could not record action execution")
+				return
+			}
+			writeAdminActionExecutionResponse(w, http.StatusBadGateway, result)
+		case RestartApplicationExecutionOutcomeUnknown:
+			writeAdminActionExecutionResponse(w, http.StatusAccepted, result)
+		default:
+			if errors.Is(executionErr, errRestartApplicationExecutionNotAllowed) {
+				writeError(w, http.StatusConflict, "action cannot be executed in its current state")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "could not execute action")
+		}
+	}
+}
+
+func writeAdminActionExecutionResponse(
+	w http.ResponseWriter,
+	status int,
+	result RestartApplicationExecutionResult,
+) {
+	response, err := newAdminActionResponse(result.Action)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not read action")
+		return
+	}
+	response.ExecutionOutcome = result.Outcome
+	response.FailureCategory = result.FailureCategory
+	writeJSON(w, status, response)
 }
 
 func decodeStrictAdminActionJSON(
@@ -319,7 +393,7 @@ func newAdminActionResponse(record storedActionProposal) (adminActionResponse, e
 		State:                proposal.State(),
 		ConfirmationRequired: decision.ConfirmationRequired,
 		WarningRequired:      decision.WarningRequired,
-		SupportsExecution:    definition.SupportsExecution,
+		SupportsExecution:    record.SupportsExecution,
 		CreatedAt:            proposal.CreatedAt().UTC(),
 		UpdatedAt:            record.UpdatedAt.UTC(),
 		HistoryEntryID:       record.HistoryEntryID,

@@ -17,9 +17,10 @@ const (
 )
 
 type adminActionHTTPFixture struct {
-	store   *chatStore
-	handler http.Handler
-	token   string
+	store     *chatStore
+	handler   http.Handler
+	token     string
+	restarter *fakeMiniDeployRestarter
 }
 
 func TestAdminActionCreateUsesAuthoritativeDirectUserPolicy(t *testing.T) {
@@ -31,12 +32,14 @@ func TestAdminActionCreateUsesAuthoritativeDirectUserPolicy(t *testing.T) {
 		state                ActionState
 		confirmationRequired bool
 		warningRequired      bool
+		supportsExecution    bool
 		eventType            ActionEventType
 	}{
 		{
 			name: "restart application", body: adminRestartRequest,
 			kind: ActionKindRestartApplication, safety: ActionSafetyRecoverable,
-			state: ActionStateAuthorized, eventType: ActionEventPolicyAuthorizedOnCreation,
+			state: ActionStateAuthorized, supportsExecution: true,
+			eventType: ActionEventPolicyAuthorizedOnCreation,
 		},
 		{
 			name: "rollback deployment", body: adminRollbackRequest,
@@ -66,7 +69,8 @@ func TestAdminActionCreateUsesAuthoritativeDirectUserPolicy(t *testing.T) {
 				created.Origin != ActionOriginDirectUser || created.SafetyClass != test.safety ||
 				created.State != test.state ||
 				created.ConfirmationRequired != test.confirmationRequired ||
-				created.WarningRequired != test.warningRequired || created.SupportsExecution ||
+				created.WarningRequired != test.warningRequired ||
+				created.SupportsExecution != test.supportsExecution ||
 				created.CreatedAt.IsZero() || created.UpdatedAt.IsZero() ||
 				created.HistoryEntryID != "" {
 
@@ -111,8 +115,12 @@ func TestAdminActionHTTPNeverInvokesMiniDeploy(t *testing.T) {
 	store := newActionTestStore(t)
 	boundary, token := cryptographicAdminTestBoundary(t)
 	a := &app{store: store, minideployURL: miniDeploy.URL, client: miniDeploy.Client()}
+	restartClient, err := newMiniDeployRestartClient(a.minideployURL, a.client)
+	if err != nil {
+		t.Fatal(err)
+	}
 	mux := http.NewServeMux()
-	a.registerAdminActionRoutes(mux)
+	a.registerAdminActionRoutes(mux, newRestartApplicationExecutor(store, restartClient))
 	handler := withCommonHeaders(boundary.protectAdminRoutes(mux))
 
 	restartResponse := performAdminActionHTTPRequest(
@@ -125,7 +133,7 @@ func TestAdminActionHTTPNeverInvokesMiniDeploy(t *testing.T) {
 	)
 	restart := decodeAdminActionHTTPResponse(t, restartResponse)
 	if restartResponse.Code != http.StatusCreated || restart.State != ActionStateAuthorized ||
-		restart.SupportsExecution {
+		!restart.SupportsExecution {
 
 		t.Fatalf("restart response status=%d action=%+v", restartResponse.Code, restart)
 	}
@@ -542,7 +550,7 @@ func TestAdminActionPersistenceConflictsMapSafely(t *testing.T) {
 	}
 }
 
-func TestAdminActionExecutionAndGenericTransitionRoutesDoNotExist(t *testing.T) {
+func TestAdminActionGenericTransitionRoutesDoNotExist(t *testing.T) {
 	fixture := newAdminActionHTTPFixture(t)
 	created := decodeAdminActionHTTPResponse(t, fixture.authenticatedRequest(
 		http.MethodPost, testAdminOrigin+"/api/admin/actions", adminRollbackRequest,
@@ -552,7 +560,6 @@ func TestAdminActionExecutionAndGenericTransitionRoutesDoNotExist(t *testing.T) 
 		method string
 		path   string
 	}{
-		{method: http.MethodPost, path: base + "/execute"},
 		{method: http.MethodPost, path: base + "/run"},
 		{method: http.MethodPost, path: base + "/start"},
 		{method: http.MethodPost, path: base + "/transition"},
@@ -652,8 +659,11 @@ func newAdminActionHTTPFixture(t *testing.T) adminActionHTTPFixture {
 	t.Helper()
 	store := newActionTestStore(t)
 	boundary, token := cryptographicAdminTestBoundary(t)
+	restarter := &fakeMiniDeployRestarter{}
 	return adminActionHTTPFixture{
-		store: store, handler: newAdminActionProductionTestHandler(store, boundary), token: token,
+		store:   store,
+		handler: newAdminActionProductionTestHandlerWithRestarter(store, boundary, restarter),
+		token:   token, restarter: restarter,
 	}
 }
 
@@ -661,10 +671,22 @@ func newAdminActionProductionTestHandler(
 	store *chatStore,
 	boundary adminSecurityBoundary,
 ) http.Handler {
+	return newAdminActionProductionTestHandlerWithRestarter(
+		store,
+		boundary,
+		&fakeMiniDeployRestarter{},
+	)
+}
+
+func newAdminActionProductionTestHandlerWithRestarter(
+	store *chatStore,
+	boundary adminSecurityBoundary,
+	restarter MiniDeployRestarter,
+) http.Handler {
 	a := &app{store: store}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", a.handleHealth)
-	a.registerAdminActionRoutes(mux)
+	a.registerAdminActionRoutes(mux, newRestartApplicationExecutor(store, restarter))
 	return withCommonHeaders(boundary.protectAdminRoutes(mux))
 }
 
