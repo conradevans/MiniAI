@@ -214,6 +214,12 @@ func main() {
 		sessions:          make(map[string]*session),
 	}
 
+	adminBoundary, err := newAdminSecurityBoundary(adminAuthConfigFromEnvironment())
+	if err != nil {
+		log.Printf("MiniAI administrator routes disabled: authentication configuration unavailable")
+		adminBoundary = disabledAdminSecurityBoundary()
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", a.handleHealth)
 	mux.HandleFunc("GET /api/v1/status", a.handleStatus)
@@ -242,7 +248,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              a.addr,
-		Handler:           withCommonHeaders(mux),
+		Handler:           withCommonHeaders(adminBoundary.protectAdminRoutes(mux)),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       90 * time.Second,
 	}
