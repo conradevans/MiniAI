@@ -102,6 +102,57 @@ func TestAdminActionCreateUsesAuthoritativeDirectUserPolicy(t *testing.T) {
 	}
 }
 
+func TestAdminActionHTTPNeverInvokesMiniDeploy(t *testing.T) {
+	requests := 0
+	miniDeploy := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests++
+	}))
+	defer miniDeploy.Close()
+	store := newActionTestStore(t)
+	boundary, token := cryptographicAdminTestBoundary(t)
+	a := &app{store: store, minideployURL: miniDeploy.URL, client: miniDeploy.Client()}
+	mux := http.NewServeMux()
+	a.registerAdminActionRoutes(mux)
+	handler := withCommonHeaders(boundary.protectAdminRoutes(mux))
+
+	restartResponse := performAdminActionHTTPRequest(
+		handler,
+		http.MethodPost,
+		testAdminOrigin+"/api/admin/actions",
+		adminRestartRequest,
+		token,
+		testAdminOrigin,
+	)
+	restart := decodeAdminActionHTTPResponse(t, restartResponse)
+	if restartResponse.Code != http.StatusCreated || restart.State != ActionStateAuthorized ||
+		restart.SupportsExecution {
+
+		t.Fatalf("restart response status=%d action=%+v", restartResponse.Code, restart)
+	}
+	rollbackResponse := performAdminActionHTTPRequest(
+		handler, http.MethodPost, testAdminOrigin+"/api/admin/actions",
+		adminRollbackRequest, token, testAdminOrigin,
+	)
+	rollback := decodeAdminActionHTTPResponse(t, rollbackResponse)
+	confirmation := performAdminActionHTTPRequest(
+		handler,
+		http.MethodPost,
+		testAdminOrigin+"/api/admin/actions/"+string(rollback.ActionID)+"/confirm",
+		`{"confirm":true,"acknowledge_warning":true}`,
+		token,
+		testAdminOrigin,
+	)
+	confirmed := decodeAdminActionHTTPResponse(t, confirmation)
+	if confirmation.Code != http.StatusOK || confirmed.State != ActionStateAuthorized ||
+		confirmed.SupportsExecution {
+
+		t.Fatalf("confirmation status=%d action=%+v", confirmation.Code, confirmed)
+	}
+	if requests != 0 {
+		t.Fatalf("HTTP proposal/confirmation made %d MiniDeploy requests", requests)
+	}
+}
+
 func TestAdminActionCreateRequiresAuthenticatedSameOriginBoundary(t *testing.T) {
 	fixture := newAdminActionHTTPFixture(t)
 	tests := []struct {
@@ -503,6 +554,7 @@ func TestAdminActionExecutionAndGenericTransitionRoutesDoNotExist(t *testing.T) 
 	}{
 		{method: http.MethodPost, path: base + "/execute"},
 		{method: http.MethodPost, path: base + "/run"},
+		{method: http.MethodPost, path: base + "/start"},
 		{method: http.MethodPost, path: base + "/transition"},
 		{method: http.MethodPatch, path: base},
 		{method: http.MethodPut, path: base},

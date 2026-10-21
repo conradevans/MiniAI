@@ -33,6 +33,16 @@ const (
 	ActionStateCancelled            = actiondomain.ActionStateCancelled
 )
 
+type ActionExecutionFailureCategory = actiondomain.ExecutionFailureCategory
+
+const (
+	ActionExecutionFailureUpstreamUnavailable = actiondomain.ExecutionFailureUpstreamUnavailable
+	ActionExecutionFailureUpstreamRejected    = actiondomain.ExecutionFailureUpstreamRejected
+	ActionExecutionFailureTimeout             = actiondomain.ExecutionFailureTimeout
+	ActionExecutionFailureInvalidResponse     = actiondomain.ExecutionFailureInvalidResponse
+	ActionExecutionFailureInternalError       = actiondomain.ExecutionFailureInternalError
+)
+
 type RepositoryProvider = actiondomain.RepositoryProvider
 
 const RepositoryProviderGitHub = actiondomain.RepositoryProviderGitHub

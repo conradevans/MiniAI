@@ -122,8 +122,8 @@ func TestActionPersistenceRejectsTamperedAuditChains(t *testing.T) {
 			ActionStateAuthorized,
 			ActionStateAuthorized,
 			eventTime,
-		); err != nil {
-			t.Fatal(err)
+		); err == nil {
+			t.Fatal("schema accepted invalid confirmation transition")
 		}
 		requireInvalidStoredAction(t, store, created.Proposal.ID())
 	})
@@ -241,14 +241,20 @@ func TestActionPersistenceRejectsTamperedAuditChains(t *testing.T) {
 	t.Run("wrong event type for valid transition", func(t *testing.T) {
 		store := newActionTestStore(t)
 		confirmed := mustConfirmRollback(t, store)
-		execActionTestSQL(
-			t,
-			store,
+		if _, err := store.db.Exec(
 			`UPDATE action_events SET event_type = 'cancelled'
 			 WHERE action_id = ? AND event_type = 'confirmation_granted'`,
 			confirmed.Proposal.ID(),
-		)
-		requireInvalidStoredAction(t, store, confirmed.Proposal.ID())
+		); err == nil {
+			t.Fatal("schema accepted an event type with the wrong transition shape")
+		}
+		loaded, err := store.getActionProposal(confirmed.Proposal.ID())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if loaded.Proposal.State() != ActionStateAuthorized {
+			t.Fatalf("rejected tamper changed state to %q", loaded.Proposal.State())
+		}
 	})
 }
 

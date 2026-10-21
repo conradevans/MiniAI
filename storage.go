@@ -18,7 +18,7 @@ const (
 	chatHistoryMaxMessages = 12
 	chatHistoryMaxRunes    = 6000
 	chatTitleMaxRunes      = 72
-	miniAISchemaVersion    = 2
+	miniAISchemaVersion    = 3
 )
 
 var errChatNotFound = errors.New("chat not found")
@@ -238,8 +238,16 @@ func (s *chatStore) initialize() error {
 	if err := migrateMiniAIActionSchemaV2(tx); err != nil {
 		return err
 	}
-	if err := validateMiniAISchemaV2(tx); err != nil {
-		return fmt.Errorf("validate chat database schema version 2: %w", err)
+	if version < 3 {
+		if err := validateMiniAISchemaV2(tx); err != nil {
+			return fmt.Errorf("validate chat database schema version 2: %w", err)
+		}
+		if err := migrateMiniAIActionSchemaV3(tx); err != nil {
+			return err
+		}
+	}
+	if err := validateMiniAISchemaV3(tx); err != nil {
+		return fmt.Errorf("validate chat database schema version 3: %w", err)
 	}
 	if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, miniAISchemaVersion)); err != nil {
 		return fmt.Errorf("set chat database schema version: %w", err)

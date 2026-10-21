@@ -22,6 +22,9 @@ const (
 	ActionEventPolicyAuthorizedOnCreation = actiondomain.RestorationEventPolicyAuthorizedOnCreation
 	ActionEventConfirmationGranted        = actiondomain.RestorationEventConfirmationGranted
 	ActionEventCancelled                  = actiondomain.RestorationEventCancelled
+	ActionEventExecutionStarted           = actiondomain.RestorationEventExecutionStarted
+	ActionEventExecutionSucceeded         = actiondomain.RestorationEventExecutionSucceeded
+	ActionEventExecutionFailed            = actiondomain.RestorationEventExecutionFailed
 )
 
 type actionProposalCreateInput struct {
@@ -40,13 +43,14 @@ type storedActionProposal struct {
 }
 
 type ActionEvent struct {
-	ID        string
-	ActionID  ActionID
-	Ordinal   int
-	Type      ActionEventType
-	FromState *ActionState
-	ToState   ActionState
-	CreatedAt time.Time
+	ID              string
+	ActionID        ActionID
+	Ordinal         int
+	Type            ActionEventType
+	FromState       *ActionState
+	ToState         ActionState
+	FailureCategory ActionExecutionFailureCategory
+	CreatedAt       time.Time
 }
 
 var (
@@ -462,9 +466,10 @@ func loadActionProposal(
 			fromState = *event.FromState
 		}
 		restorationEvents = append(restorationEvents, actiondomain.RestorationEvent{
-			Type:      event.Type,
-			FromState: fromState,
-			ToState:   event.ToState,
+			Type:            event.Type,
+			FromState:       fromState,
+			ToState:         event.ToState,
+			FailureCategory: event.FailureCategory,
 		})
 	}
 	proposal, err := actiondomain.RestoreProposal(actiondomain.ProposalInput{
@@ -502,7 +507,7 @@ func loadActionEvents(
 	actionID ActionID,
 ) ([]ActionEvent, error) {
 	rows, err := queryer.Query(
-		`SELECT event_id, ordinal, event_type, from_state, to_state, created_at
+		`SELECT event_id, ordinal, event_type, from_state, to_state, failure_category, created_at
 		 FROM action_events WHERE action_id = ? ORDER BY ordinal ASC`,
 		actionID,
 	)
@@ -515,6 +520,7 @@ func loadActionEvents(
 	for rows.Next() {
 		var event ActionEvent
 		var eventType, toState, createdAtText string
+		var failureCategory sql.NullString
 		var fromState sql.NullString
 		if err := rows.Scan(
 			&event.ID,
@@ -522,6 +528,7 @@ func loadActionEvents(
 			&eventType,
 			&fromState,
 			&toState,
+			&failureCategory,
 			&createdAtText,
 		); err != nil {
 			return nil, err
@@ -533,6 +540,9 @@ func loadActionEvents(
 		}
 		event.ActionID = actionID
 		event.Type = ActionEventType(eventType)
+		if failureCategory.Valid {
+			event.FailureCategory = ActionExecutionFailureCategory(failureCategory.String)
+		}
 		event.ToState = ActionState(toState)
 		if fromState.Valid {
 			value := ActionState(fromState.String)

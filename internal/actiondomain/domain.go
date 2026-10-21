@@ -112,11 +112,19 @@ func (DeployRepositoryArguments) actionArgumentsKind() ActionKind {
 }
 
 type ActionDefinition struct {
-	Kind              ActionKind
-	SafetyClass       ActionSafetyClass
-	TargetType        ActionTargetType
-	SupportsExecution bool
+	Kind                ActionKind
+	SafetyClass         ActionSafetyClass
+	TargetType          ActionTargetType
+	SupportsExecution   bool
+	executionFoundation actionExecutionFoundation
 }
+
+type actionExecutionFoundation uint8
+
+const (
+	actionExecutionFoundationNone actionExecutionFoundation = iota
+	actionExecutionFoundationRestartApplication
+)
 
 type ProposalInput struct {
 	ID        ActionID
@@ -222,10 +230,11 @@ func LookupDefinition(kind ActionKind) (ActionDefinition, bool) {
 	switch kind {
 	case ActionKindRestartApplication:
 		return ActionDefinition{
-			Kind:              ActionKindRestartApplication,
-			SafetyClass:       ActionSafetyRecoverable,
-			TargetType:        ActionTargetApplication,
-			SupportsExecution: false,
+			Kind:                ActionKindRestartApplication,
+			SafetyClass:         ActionSafetyRecoverable,
+			TargetType:          ActionTargetApplication,
+			SupportsExecution:   false,
+			executionFoundation: actionExecutionFoundationRestartApplication,
 		}, true
 	case ActionKindRollbackDeployment:
 		return ActionDefinition{
@@ -410,6 +419,37 @@ func ValidActionSafetyClass(safetyClass ActionSafetyClass) bool {
 	default:
 		return false
 	}
+}
+
+// ValidateRestartExecutionFoundation revalidates the complete opaque proposal
+// against the closed catalog before the restart-specific executor may begin.
+// The foundation permit is intentionally separate from SupportsExecution:
+// Phase 4B1 provides no API or automatic path that can execute an action.
+func ValidateRestartExecutionFoundation(proposal Proposal) error {
+	if _, err := EvaluateProposal(proposal); err != nil {
+		return err
+	}
+	definition, ok := LookupDefinition(proposal.kind)
+	if !ok || definition.executionFoundation != actionExecutionFoundationRestartApplication ||
+		proposal.kind != ActionKindRestartApplication ||
+		definition.TargetType != ActionTargetApplication ||
+		proposal.target.Type != ActionTargetApplication {
+
+		return ErrActionExecutionUnsupported
+	}
+	if _, ok := proposal.arguments.(RestartApplicationArguments); !ok {
+		return ErrInvalidActionArguments
+	}
+	return nil
+}
+
+func supportsRestoredExecutionState(kind ActionKind) bool {
+	definition, ok := LookupDefinition(kind)
+	return ok && definition.executionFoundation == actionExecutionFoundationRestartApplication
+}
+
+func ValidApplicationTargetID(id string) bool {
+	return appIDPattern.MatchString(id)
 }
 
 func ValidateStateTransition(from, to ActionState) error {

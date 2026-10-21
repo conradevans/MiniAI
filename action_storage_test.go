@@ -293,23 +293,81 @@ func TestActionPersistenceRejectsTamperedRecords(t *testing.T) {
 	}
 }
 
-func TestActionPersistenceRejectsExecutionStatesWhileUnsupported(t *testing.T) {
+func TestActionPersistenceRejectsRestartExecutionStateWithoutAuditChain(t *testing.T) {
 	for _, state := range []ActionState{
 		ActionStateExecuting, ActionStateSucceeded, ActionStateFailed,
 	} {
 		t.Run(string(state), func(t *testing.T) {
 			store := newActionTestStore(t)
 			created := mustCreateRestart(t, store, ActionOriginDirectUser)
-			setIgnoredActionChecks(t, store, true)
 			execActionTestSQL(t, store, `UPDATE action_proposals SET current_state = ? WHERE action_id = ?`, state, created.Proposal.ID())
-			setIgnoredActionChecks(t, store, false)
 			_, err := store.getActionProposal(created.Proposal.ID())
 			if !errors.Is(err, errInvalidPersistedAction) ||
-				!errors.Is(err, actiondomain.ErrActionExecutionUnsupported) {
+				!errors.Is(err, actiondomain.ErrActionAuditMismatch) {
 
 				t.Fatalf("state %q should fail closed, got %v", state, err)
 			}
 		})
+	}
+}
+
+func TestActionPersistenceRejectsOtherActionExecutionStates(t *testing.T) {
+	tests := []struct {
+		name   string
+		create func(*testing.T, *chatStore) storedActionProposal
+	}{
+		{
+			name: "rollback",
+			create: func(t *testing.T, store *chatStore) storedActionProposal {
+				created := mustCreateRollback(t, store, ActionOriginDirectUser, "")
+				authorized, err := store.confirmAction(created.Proposal.ID())
+				if err != nil {
+					t.Fatal(err)
+				}
+				return authorized
+			},
+		},
+		{
+			name: "deploy",
+			create: func(t *testing.T, store *chatStore) storedActionProposal {
+				created := mustCreateAction(t, store, actionProposalCreateInput{
+					Kind: ActionKindDeployRepository, Origin: ActionOriginDirectUser,
+					Target: ActionTarget{Type: ActionTargetRepository, ID: "owner/repository"},
+					Arguments: DeployRepositoryArguments{
+						Provider:      RepositoryProviderGitHub,
+						ContainerPort: 8080,
+						HealthPath:    "/health",
+					},
+					CreatedAt: actionTestTime(),
+				})
+				authorized, err := store.confirmAction(created.Proposal.ID())
+				if err != nil {
+					t.Fatal(err)
+				}
+				return authorized
+			},
+		},
+	}
+	for _, test := range tests {
+		for _, state := range []ActionState{
+			ActionStateExecuting, ActionStateSucceeded, ActionStateFailed,
+		} {
+			t.Run(test.name+"/"+string(state), func(t *testing.T) {
+				store := newActionTestStore(t)
+				created := test.create(t, store)
+				execActionTestSQL(
+					t, store,
+					`UPDATE action_proposals SET current_state = ? WHERE action_id = ?`,
+					state, created.Proposal.ID(),
+				)
+				_, err := store.getActionProposal(created.Proposal.ID())
+				if !errors.Is(err, errInvalidPersistedAction) ||
+					!errors.Is(err, actiondomain.ErrActionExecutionUnsupported) {
+
+					t.Fatalf("state %q should fail closed, got %v", state, err)
+				}
+			})
+		}
 	}
 }
 
