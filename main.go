@@ -541,7 +541,7 @@ func (a *app) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		)
 		return
 	}
-	if isEvidenceSeekingQuestion(req.Message) && a.handlePhase2CStream(w, r, req.Message, history) {
+	if isEvidenceSeekingQuestion(req.Message) && a.handlePhase2CStreamForHistory(w, r, req.Message, history, historyEntry.ID) {
 		return
 	}
 

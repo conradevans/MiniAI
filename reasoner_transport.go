@@ -38,6 +38,7 @@ func reasonerAnswerInstructions(packet EvidencePacket) string {
 		"Lead with the direct conclusion. Synthesize overlapping evidence and state each conclusion once. Use facts for only the strongest distinct supporting points; do not restate the conclusion or another fact. Keep the answer concise and use evidence only to support the conclusion. Translate structured evidence fields into natural user-facing language. Never copy raw JSON keys, snake_case schema field names, or evidence packet property names into prose; for example, express latest_status as ordinary language rather than quoting the key. Do not treat underscores in genuine entity identifiers as schema leakage.",
 		reasonerTemporalAnswerInstruction(packet.Temporal),
 		reasonerCoverageAnswerInstruction(packet),
+		reasonerActionSuggestionInstruction(packet),
 	}
 	if confidence := packet.Confidence.Level; confidence == ConfidenceHigh || confidence == ConfidenceMedium || confidence == ConfidenceLow {
 		instructions = append(instructions, "Software-owned confidence is "+string(confidence)+" and is authoritative. Do not state, repeat, alter, or explain it; software appends it exactly once.")

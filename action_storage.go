@@ -181,6 +181,79 @@ func (s *chatStore) createActionProposal(
 	}, nil
 }
 
+// createAssistantRestartSuggestion is idempotent only within one trusted History request.
+// The store mutex serializes same-process response retries; the durable History lookup
+// preserves the same identity after a process reopen without suppressing later investigations.
+func (s *chatStore) createAssistantRestartSuggestion(
+	historyEntryID string,
+	target ActionTarget,
+) (storedActionProposal, error) {
+	if s == nil || s.db == nil || historyEntryID == "" ||
+		historyEntryID != strings.TrimSpace(historyEntryID) ||
+		target.Type != ActionTargetApplication ||
+		!validActionApplicationTargetID(target.ID) {
+
+		return storedActionProposal{}, errActionHistoryLink
+	}
+	s.assistantSuggestionMu.Lock()
+	defer s.assistantSuggestionMu.Unlock()
+
+	rows, err := s.db.Query(
+		`SELECT action_id FROM action_proposals
+		 WHERE history_entry_id = ? AND action_kind = ? AND origin = ?
+		 ORDER BY created_at ASC, action_id ASC`,
+		historyEntryID,
+		ActionKindRestartApplication,
+		ActionOriginAssistantSuggested,
+	)
+	if err != nil {
+		return storedActionProposal{}, err
+	}
+	ids := []ActionID{}
+	for rows.Next() {
+		var id ActionID
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return storedActionProposal{}, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return storedActionProposal{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return storedActionProposal{}, err
+	}
+	if len(ids) > 1 {
+		return storedActionProposal{}, errActionPersistenceConflict
+	}
+	if len(ids) == 1 {
+		record, err := s.getActionProposal(ids[0])
+		if err != nil {
+			return storedActionProposal{}, err
+		}
+		proposalTarget := record.Proposal.Target()
+		if record.HistoryEntryID != historyEntryID ||
+			record.Proposal.Kind() != ActionKindRestartApplication ||
+			record.Proposal.Origin() != ActionOriginAssistantSuggested ||
+			proposalTarget != target {
+
+			return storedActionProposal{}, errActionPersistenceConflict
+		}
+		if _, ok := record.Proposal.Arguments().(RestartApplicationArguments); !ok {
+			return storedActionProposal{}, errActionPersistenceConflict
+		}
+		return record, nil
+	}
+
+	return s.createActionProposal(actionProposalCreateInput{
+		Kind: ActionKindRestartApplication, Origin: ActionOriginAssistantSuggested,
+		Target: target, Arguments: RestartApplicationArguments{},
+		HistoryEntryID: historyEntryID,
+	})
+}
+
 func (s *chatStore) getActionProposal(
 	id ActionID,
 ) (storedActionProposal, error) {

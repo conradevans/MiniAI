@@ -180,6 +180,10 @@ func isExactDeterministicDiagnosticIntent(message string) bool {
 }
 
 func (a *app) handlePhase2CStream(w http.ResponseWriter, r *http.Request, question string, history []storedMessage) bool {
+	return a.handlePhase2CStreamForHistory(w, r, question, history, "")
+}
+
+func (a *app) handlePhase2CStreamForHistory(w http.ResponseWriter, r *http.Request, question string, history []storedMessage, historyEntryID string) bool {
 	if !isEvidenceSeekingQuestion(question) {
 		return false
 	}
@@ -302,6 +306,7 @@ func (a *app) handlePhase2CStream(w http.ResponseWriter, r *http.Request, questi
 	answer := safeReasonerLimitation()
 	validation := "transport_error"
 	confidence := ConfidenceLow
+	var actionSuggestion *assistantActionSuggestionResponse
 	if reasonerErr == nil {
 		if completionErr := validateReasonerCompletion(reasonerResponse); completionErr != nil {
 			log.Printf("Phase 2C reasoner validation rejected: %s", safeReasonerValidationError(completionErr))
@@ -315,6 +320,14 @@ func (a *app) handlePhase2CStream(w http.ResponseWriter, r *http.Request, questi
 				}
 				answer = renderReasonerAnswer(draft, confidence)
 				validation = "valid"
+				if historyEntryID != "" && r.Context().Err() == nil {
+					actionSuggestion, validationErr = a.persistReasonerActionSuggestion(
+						historyEntryID, draft, result.Packet,
+					)
+					if validationErr != nil {
+						log.Printf("Phase 4C1 action suggestion discarded: %s", safeAssistantSuggestionError(validationErr))
+					}
+				}
 			} else {
 				log.Printf("Phase 2C reasoner validation rejected: %s", safeReasonerValidationError(validationErr))
 				validation = "invalid"
@@ -325,6 +338,7 @@ func (a *app) handlePhase2CStream(w http.ResponseWriter, r *http.Request, questi
 	emitPhase2CDone(
 		w, flusher, policy, prepared.Route.ID, result.Plan.LogicalReads, result.EvidenceRounds,
 		result.SecondRoundReads, len(result.PacketJSON), reasonerCalls, reasonerResponse, started, validation, confidence,
+		actionSuggestion,
 	)
 	return true
 }
@@ -412,12 +426,12 @@ func phase2CResultSummary(result EvidenceResult) string {
 	return "evidence read completed"
 }
 
-func emitPhase2CDone(w http.ResponseWriter, flusher http.Flusher, policy modelPolicy, route InvestigationRouteID, toolCalls, evidenceRounds, secondRoundReads, packetBytes, reasonerCalls int, response chatAPIResponse, started time.Time, validation string, confidence ConfidenceLevel) {
+func emitPhase2CDone(w http.ResponseWriter, flusher http.Flusher, policy modelPolicy, route InvestigationRouteID, toolCalls, evidenceRounds, secondRoundReads, packetBytes, reasonerCalls int, response chatAPIResponse, started time.Time, validation string, confidence ConfidenceLevel, actionSuggestion *assistantActionSuggestionResponse) {
 	tokensPerSecond := 0.0
 	if response.EvalDuration > 0 {
 		tokensPerSecond = float64(response.EvalCount) / (float64(response.EvalDuration) / 1e9)
 	}
-	sendSSE(w, "done", map[string]any{
+	done := map[string]any{
 		"answer_mode": "phase2c", "route": route,
 		"model": policy.Model, "mode": policy.Mode, "agent": true, "model_invoked": reasonerCalls == 1,
 		"planner_calls": 0, "reasoner_calls": reasonerCalls, "tool_calls": toolCalls,
@@ -431,7 +445,11 @@ func emitPhase2CDone(w http.ResponseWriter, flusher http.Flusher, policy modelPo
 		"load_seconds":          round2(float64(response.LoadDuration) / 1e9),
 		"total_seconds":         round2(float64(response.TotalDuration) / 1e9),
 		"investigation_seconds": round2(time.Since(started).Seconds()),
-	})
+	}
+	if actionSuggestion != nil {
+		done["action_suggestion"] = actionSuggestion
+	}
+	sendSSE(w, "done", done)
 	flusher.Flush()
 }
 
@@ -447,7 +465,7 @@ func emitPhase2CPostEvidenceLimitation(w http.ResponseWriter, flusher http.Flush
 	emitBufferedAnswer(w, flusher, safeReasonerLimitation())
 	emitPhase2CDone(
 		w, flusher, modelPolicy{}, result.Route.ID, result.Plan.LogicalReads, result.EvidenceRounds,
-		result.SecondRoundReads, len(result.PacketJSON), 0, chatAPIResponse{}, started, reason, ConfidenceLow,
+		result.SecondRoundReads, len(result.PacketJSON), 0, chatAPIResponse{}, started, reason, ConfidenceLow, nil,
 	)
 }
 
@@ -479,7 +497,7 @@ func (a *app) emitPhase2CLimitation(w http.ResponseWriter, prepared Phase2BPrepa
 		emitPhase2CToolEvents(w, flusher, plan, result.Results)
 	}
 	emitBufferedAnswer(w, flusher, safeReasonerLimitation())
-	emitPhase2CDone(w, flusher, modelPolicy{}, route, toolCalls, evidenceRounds, result.SecondRoundReads, packetBytes, 0, chatAPIResponse{}, started, reason, ConfidenceLow)
+	emitPhase2CDone(w, flusher, modelPolicy{}, route, toolCalls, evidenceRounds, result.SecondRoundReads, packetBytes, 0, chatAPIResponse{}, started, reason, ConfidenceLow, nil)
 }
 
 func emitPhase2CClarification(w http.ResponseWriter, decision ShadowRouteDecision, answer string) {

@@ -112,3 +112,7 @@ func transitionActionProposal(
 func validActionID(id ActionID) bool {
 	return actiondomain.ValidActionID(id)
 }
+
+func validActionApplicationTargetID(id string) bool {
+	return actiondomain.ValidApplicationTargetID(id)
+}

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -24,7 +25,8 @@ const (
 var errChatNotFound = errors.New("chat not found")
 
 type chatStore struct {
-	db *sql.DB
+	db                    *sql.DB
+	assistantSuggestionMu sync.Mutex
 }
 
 type chatRecord struct {
