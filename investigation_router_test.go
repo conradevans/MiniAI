@@ -158,6 +158,94 @@ func TestApplicationIncidentExplanationUsesHistoricalRoute(t *testing.T) {
 	}
 }
 
+func TestApplicationRuntimeTrendUsesHistoricalRoute(t *testing.T) {
+	const question = "Has MyScheduler had any failures in the last 24 hours?"
+	route := buildShadowInvestigationRoute(question, testShadowRouterContext())
+	if route.ID != RouteApplicationPerformance || route.Resolution != RouteResolutionSupported ||
+		route.Frame.Goal != GoalTrend || route.Frame.Temporal.Kind != TemporalNamedWindow ||
+		route.Frame.Temporal.NamedRange != "24h" || route.Frame.Ambiguity.Ambiguous ||
+		len(route.Frame.Subjects) != 1 || route.Frame.Subjects[0].Kind != SubjectApplication ||
+		route.Frame.Subjects[0].ID != "myscheduler" || !hasDomain(route.Frame, DomainApplication) ||
+		!hasDomain(route.Frame, DomainRuntime) || len(route.Frame.Domains) != 2 ||
+		!isApplicationRuntimeTrend(route.Frame) {
+
+		t.Fatalf("application runtime trend route=%+v", route)
+	}
+	assertRequirementTypes(t, route, []EvidenceType{
+		EvidenceTypeCurrentApplication,
+		EvidenceTypeApplicationHistory,
+		EvidenceTypeServiceHistory,
+		EvidenceTypeHostHistory,
+		EvidenceTypeRuntimeFailures,
+	})
+}
+
+func TestApplicationRuntimeTrendPredicateUsesSetSemantics(t *testing.T) {
+	for _, domains := range [][]EvidenceDomain{
+		{DomainApplication, DomainRuntime},
+		{DomainRuntime, DomainApplication},
+		{DomainRuntime, DomainApplication, DomainRuntime},
+	} {
+		frame := QuestionFrame{Goal: GoalTrend, Domains: domains}
+		if !isApplicationRuntimeTrend(frame) || unsupportedReason(frame) != "" ||
+			selectSemanticRoute(frame) != RouteApplicationPerformance {
+
+			t.Fatalf("application/runtime domains=%v were not supported consistently", domains)
+		}
+	}
+}
+
+func TestApplicationRuntimeTrendRejectsNonExactDomainSets(t *testing.T) {
+	tests := []struct {
+		name    string
+		domains []EvidenceDomain
+	}{
+		{name: "runtime only", domains: []EvidenceDomain{DomainRuntime}},
+		{name: "host runtime", domains: []EvidenceDomain{DomainPlatform, DomainRuntime}},
+		{name: "application runtime database", domains: []EvidenceDomain{DomainApplication, DomainRuntime, DomainDatabase}},
+		{name: "application runtime repository", domains: []EvidenceDomain{DomainApplication, DomainRuntime, DomainRepository}},
+		{name: "application runtime deployment", domains: []EvidenceDomain{DomainApplication, DomainRuntime, DomainDeployment}},
+		{name: "application runtime infrastructure", domains: []EvidenceDomain{DomainApplication, DomainRuntime, DomainInfrastructure}},
+		{name: "application runtime platform", domains: []EvidenceDomain{DomainApplication, DomainRuntime, DomainPlatform}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			frame := QuestionFrame{Goal: GoalTrend, Domains: test.domains}
+			if isApplicationRuntimeTrend(frame) {
+				t.Fatalf("non-exact domains accepted: %v", test.domains)
+			}
+			if reason := unsupportedReason(frame); reason != "trend_not_supported_for_domains" {
+				t.Fatalf("unsupported reason=%q domains=%v", reason, test.domains)
+			}
+			if route := selectSemanticRoute(frame); route != RouteUnresolved {
+				t.Fatalf("unsupported domains=%v route=%q", test.domains, route)
+			}
+		})
+	}
+}
+
+func TestExistingSupportedTrendRoutesRemainSupported(t *testing.T) {
+	tests := []struct {
+		name     string
+		question string
+		route    InvestigationRouteID
+	}{
+		{name: "application performance", question: "Show MyScheduler performance history", route: RouteApplicationPerformance},
+		{name: "thermal", question: "Show Dell thermal history", route: RouteThermalInvestigation},
+		{name: "recovery", question: "Show Dell restart history", route: RouteRestartInvestigation},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			decision := buildShadowInvestigationRoute(test.question, testShadowRouterContext())
+			if decision.Frame.Goal != GoalTrend || decision.Resolution != RouteResolutionSupported ||
+				decision.ID != test.route {
+
+				t.Fatalf("existing trend route changed: %+v", decision)
+			}
+		})
+	}
+}
+
 func TestRuntimeFailureMorphology(t *testing.T) {
 	for _, form := range []string{"fail", "fails", "failed", "failing", "failure", "failures"} {
 		frame := QuestionFrame{Domains: classifyEvidenceDomains("MyScheduler " + form)}

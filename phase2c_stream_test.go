@@ -428,6 +428,61 @@ func TestPhase2CProductionRegressionPreparesHistoricalApplicationEvidence(t *tes
 	}
 }
 
+func TestPhase2CApplicationRuntimeTrendPreparesExistingBoundedEvidencePlan(t *testing.T) {
+	const question = "Has MyScheduler had any failures in the last 24 hours?"
+	h := newPhase2CTestHarness(t, 12)
+	context := h.app.buildProductionRouterContext(t.Context(), question, nil, h.app.phase2CNow())
+	prepared, err := h.app.phase2CPipeline().Prepare(question, context)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared.Route.ID != RouteApplicationPerformance ||
+		prepared.Route.Resolution != RouteResolutionSupported ||
+		prepared.Route.Frame.Goal != GoalTrend ||
+		prepared.Route.Frame.Temporal.Kind != TemporalNamedWindow ||
+		prepared.Route.Frame.Temporal.NamedRange != "24h" ||
+		len(prepared.Route.Frame.Subjects) != 1 ||
+		prepared.Route.Frame.Subjects[0] != (EvidenceSubject{Kind: SubjectApplication, ID: "myscheduler", Name: "myscheduler"}) {
+
+		t.Fatalf("route=%+v", prepared.Route)
+	}
+
+	wantArguments := map[string]map[string]any{
+		"get_app_context":          {"app": "myscheduler"},
+		"read_host_history":        {"range": "24h"},
+		"read_application_history": {"app": "myscheduler", "range": "24h"},
+		"read_service_history":     {"range": "24h"},
+		"read_runtime_logs":        {"app": "myscheduler"},
+	}
+	if prepared.Plan.LogicalReads != len(wantArguments) || prepared.Plan.CostUnits != 12 ||
+		len(prepared.Plan.Requests) != len(wantArguments) {
+
+		t.Fatalf("plan=%+v", prepared.Plan)
+	}
+	seen := map[string]bool{}
+	for _, request := range prepared.Plan.Requests {
+		if request.Capability == "read_deployment_history" {
+			t.Fatalf("unexpected deployment-history read: %+v", request)
+		}
+		want, ok := wantArguments[request.Capability]
+		if !ok {
+			t.Fatalf("unexpected capability %q", request.Capability)
+		}
+		if !reflect.DeepEqual(request.Arguments, want) {
+			t.Fatalf("%s arguments=%v want %v", request.Capability, request.Arguments, want)
+		}
+		seen[request.Capability] = true
+	}
+	if len(seen) != len(wantArguments) {
+		t.Fatalf("capabilities=%v want %v", seen, wantArguments)
+	}
+	for _, requirement := range prepared.Route.Requirements {
+		if requirement.Type == EvidenceTypeRuntimeFailures && requirement.Criticality != CriticalityRelevant {
+			t.Fatalf("runtime requirement became %q: %+v", requirement.Criticality, requirement)
+		}
+	}
+}
+
 func TestPhase2CToolRequestIDsAreStable(t *testing.T) {
 	h := newPhase2CTestHarness(t, 12)
 	run := func() []string {

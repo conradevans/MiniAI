@@ -537,6 +537,8 @@ func selectSemanticRoute(frame QuestionFrame) InvestigationRouteID {
 	case hasDomain(frame, DomainApplication) && hasDomain(frame, DomainPerformance) &&
 		(frame.Goal == GoalCurrentAssessment || frame.Goal == GoalTrend || frame.Goal == GoalIncidentExplanation):
 		return RouteApplicationPerformance
+	case isApplicationRuntimeTrend(frame):
+		return RouteApplicationPerformance
 	case hasDomain(frame, DomainApplication) && frame.Goal == GoalIncidentExplanation:
 		return RouteApplicationPerformance
 	case hasDomain(frame, DomainApplication) &&
@@ -574,10 +576,27 @@ func unsupportedReason(frame QuestionFrame) string {
 		return ""
 	}
 	if hasDomain(frame, DomainThermal) || hasDomain(frame, DomainRecovery) ||
-		(hasDomain(frame, DomainApplication) && hasDomain(frame, DomainPerformance)) {
+		(hasDomain(frame, DomainApplication) && hasDomain(frame, DomainPerformance)) ||
+		isApplicationRuntimeTrend(frame) {
 		return ""
 	}
 	return "trend_not_supported_for_domains"
+}
+
+func isApplicationRuntimeTrend(frame QuestionFrame) bool {
+	if frame.Goal != GoalTrend {
+		return false
+	}
+	domains := make(map[EvidenceDomain]struct{}, len(frame.Domains))
+	for _, domain := range frame.Domains {
+		domains[domain] = struct{}{}
+	}
+	if len(domains) != 2 {
+		return false
+	}
+	_, hasApplication := domains[DomainApplication]
+	_, hasRuntime := domains[DomainRuntime]
+	return hasApplication && hasRuntime
 }
 
 func requiresResolvedApplication(frame QuestionFrame) bool {

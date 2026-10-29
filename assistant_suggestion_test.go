@@ -532,6 +532,227 @@ func TestPhase2CNoSuggestionPreservesNormalInvestigation(t *testing.T) {
 	}
 }
 
+func productionApplicationRuntimeTrendExecutor(now time.Time) applicationIncidentPipelineExecutor {
+	executor := productionApplicationIncidentExecutor(now)
+
+	contextResult := executor.values["get_app_context"].(reactorLabAppContextResult)
+	contextResult.Deployment.Status = "running"
+	for index := range contextResult.Deployment.Services {
+		contextResult.Deployment.Services[index].Status = "running"
+	}
+	executor.values["get_app_context"] = contextResult
+
+	applicationHistory := executor.values["read_application_history"].(reactorLabResolvedApplicationHistory)
+	applicationHistory.Application.LatestStatus = "running"
+	applicationHistory.Application.RestartCount = 0
+	for index := range applicationHistory.History.Points {
+		applicationHistory.History.Points[index].Status = "running"
+		applicationHistory.History.Points[index].RestartCount = 0
+	}
+	executor.values["read_application_history"] = applicationHistory
+
+	serviceHistory := executor.values["read_service_history"].(reactorLabServiceHistory)
+	for serviceIndex := range serviceHistory.Services {
+		for pointIndex := range serviceHistory.Services[serviceIndex].Points {
+			serviceHistory.Services[serviceIndex].Points[pointIndex].Status = "running"
+			serviceHistory.Services[serviceIndex].Points[pointIndex].Available = true
+		}
+	}
+	executor.values["read_service_history"] = serviceHistory
+
+	logLines := make([]string, 0, 12)
+	for index := 0; index < 12; index++ {
+		at := now.Add(-time.Duration(12-index) * 5 * time.Minute)
+		logLines = append(logLines, at.Format(time.RFC3339Nano)+" INFO health request completed with status 200")
+	}
+	logs := strings.Join(logLines, "\n")
+	executor.values["read_runtime_logs"] = logToolResponse{
+		App: "myscheduler", Kind: "runtime", Lines: len(logLines), Bytes: len(logs),
+		Logs: logs, Truncated: true,
+	}
+	return executor
+}
+
+func applicationRuntimeTrendNoSuggestionResponse(request chatAPIRequest) string {
+	packet, err := evidencePacketFromReasonerRequest(request)
+	if err != nil {
+		return "{}"
+	}
+	currentID, historyID, runtimeID := "", "", ""
+	for _, item := range packet.Evidence {
+		switch item.Type {
+		case EvidenceTypeCurrentApplication:
+			if currentID == "" {
+				currentID = item.ID
+			}
+		case EvidenceTypeApplicationHistory:
+			if historyID == "" {
+				historyID = item.ID
+			}
+		case EvidenceTypeRuntimeFailures:
+			if runtimeID == "" {
+				runtimeID = item.ID
+			}
+		}
+	}
+	conclusion := "MyScheduler is running in the available current evidence."
+	conclusionID := currentID
+	if historyID != "" {
+		conclusion = "Available application evidence records no MyScheduler failures or restarts in the last 24 hours."
+		conclusionID = historyID
+	}
+	if conclusionID == "" || runtimeID == "" {
+		return "{}"
+	}
+	draft := ReasonerDraft{
+		Conclusion:         conclusion,
+		ConclusionEvidence: []string{conclusionID},
+		Facts:              []ReasonerFact{},
+		Uncertainty: []ReasonerFact{{
+			Text:        "Runtime-log coverage was incomplete for the last 24 hours.",
+			EvidenceIDs: []string{runtimeID},
+		}},
+	}
+	encoded, _ := json.Marshal(draft)
+	return string(encoded)
+}
+
+func TestPhase2CApplicationRuntimeTrendPartialLogsReturnsNormalAnswerWithoutAction(t *testing.T) {
+	const question = "Has MyScheduler had any failures in the last 24 hours?"
+	h := newPhase2CTestHarness(t, 12)
+	now := time.Date(2026, 9, 28, 5, 6, 47, 0, time.UTC)
+	h.app.phase2Now = func() time.Time { return now }
+	h.app.phase2Executor = productionApplicationRuntimeTrendExecutor(now)
+	h.responseBuilder = applicationRuntimeTrendNoSuggestionResponse
+
+	var miniDeployMutationCalls atomic.Int64
+	miniDeploy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		miniDeployMutationCalls.Add(1)
+		http.Error(w, "unexpected MiniDeploy mutation", http.StatusInternalServerError)
+	}))
+	defer miniDeploy.Close()
+	h.app.minideployURL = miniDeploy.URL
+
+	stream := h.runChat(t, "application-runtime-trend", "", question)
+	requests := h.reasonerRequests()
+	if len(requests) != 1 || len(h.plannerRequests()) != 0 || len(h.generations()) != 0 {
+		t.Fatalf("reasoner=%d planner=%d direct=%d stream=%s",
+			len(requests), len(h.plannerRequests()), len(h.generations()), stream)
+	}
+	packet, err := evidencePacketFromReasonerRequest(requests[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if packet.Route != RouteApplicationPerformance || packet.Goal != GoalTrend ||
+		packet.Temporal.Kind != TemporalNamedWindow || packet.Temporal.NamedRange != "24h" ||
+		packet.Confidence.Level != ConfidenceMedium || packet.Confidence.Inputs.Coverage != CoveragePartial {
+
+		t.Fatalf("reasoner packet=%+v", packet)
+	}
+	if !strings.Contains(requests[0].Messages[1].Content, "Runtime-log coverage was incomplete for the last 24 hours") {
+		t.Fatalf("reasoner request omitted runtime limitation: %s", requests[0].Messages[1].Content)
+	}
+	answer := phase2CStreamAnswer(t, stream)
+	if answer == "" || answer == safeReasonerLimitation() ||
+		strings.Contains(answer, "I couldn't safely gather the specific ReactorLab evidence needed") ||
+		!strings.Contains(answer, "last 24 hours") ||
+		!strings.Contains(answer, "Uncertainty: Runtime-log coverage was incomplete") {
+
+		t.Fatalf("qualified normal answer=%q stream=%s", answer, stream)
+	}
+	for _, marker := range []string{
+		"\"answer_mode\":\"phase2c\"",
+		"\"route\":\"application_performance_investigation\"",
+		"\"model_invoked\":true",
+		"\"reasoner_calls\":1",
+		"\"evidence_rounds\":1",
+		"\"second_round_reads\":0",
+		"\"confidence\":\"Medium\"",
+		"\"answer_validation\":\"valid\"",
+	} {
+		if !strings.Contains(stream, marker) {
+			t.Fatalf("missing %s in stream=%s", marker, stream)
+		}
+	}
+	if strings.Contains(stream, "unsupported_local_evidence") || strings.Contains(stream, "\"action_suggestion\"") {
+		t.Fatalf("normal answer entered unsupported or action path: %s", stream)
+	}
+	starts := map[string]bool{}
+	for _, event := range phase2CToolEvents(t, stream) {
+		if event.Phase == "start" {
+			starts[event.Name] = true
+		}
+	}
+	for _, capability := range []string{
+		"get_app_context", "read_host_history", "read_application_history",
+		"read_service_history", "read_runtime_logs",
+	} {
+		if !starts[capability] {
+			t.Fatalf("missing %s read: %v", capability, starts)
+		}
+	}
+	if len(starts) != 5 || starts["read_deployment_history"] {
+		t.Fatalf("unexpected evidence reads: %v", starts)
+	}
+	if got := assistantActionRowCount(t, h.app.store); got != 0 {
+		t.Fatalf("normal answer persisted %d assistant actions", got)
+	}
+	var eventCount int
+	if err := h.app.store.db.QueryRow("SELECT COUNT(*) FROM action_events").Scan(&eventCount); err != nil {
+		t.Fatal(err)
+	}
+	if eventCount != 0 {
+		t.Fatalf("normal answer created %d confirmation/execution events", eventCount)
+	}
+	if miniDeployMutationCalls.Load() != 0 {
+		t.Fatalf("normal answer contacted MiniDeploy %d times", miniDeployMutationCalls.Load())
+	}
+}
+
+func TestPhase2CApplicationRuntimeTrendIneligibleSuggestionDoesNotSuppressAnswer(t *testing.T) {
+	const question = "Has MyScheduler had any failures in the last 24 hours?"
+	h := newPhase2CTestHarness(t, 12)
+	now := time.Date(2026, 9, 28, 5, 6, 47, 0, time.UTC)
+	h.app.phase2Now = func() time.Time { return now }
+	executor := productionApplicationRuntimeTrendExecutor(now)
+	executor.failures["read_application_history"] = errReactorLabUnavailable
+	h.app.phase2Executor = executor
+	h.responseBuilder = applicationRuntimeTrendNoSuggestionResponse
+
+	stream := h.runChat(t, "application-runtime-trend-ineligible-action", "", question)
+	requests := h.reasonerRequests()
+	if len(requests) != 1 {
+		t.Fatalf("reasoner calls=%d stream=%s", len(requests), stream)
+	}
+	packet, err := evidencePacketFromReasonerRequest(requests[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if packet.Confidence.Level != ConfidenceLow ||
+		packet.Confidence.Inputs.CriticalCompleteness != CompletenessMissing ||
+		reasonerActionSuggestionEligible(packet) {
+
+		t.Fatalf("suggestion unexpectedly eligible: %+v", packet.Confidence)
+	}
+	if answer := phase2CStreamAnswer(t, stream); answer == "" || answer == safeReasonerLimitation() {
+		t.Fatalf("ineligible suggestion suppressed normal answer: %q stream=%s", answer, stream)
+	}
+	if !strings.Contains(stream, "\"model_invoked\":true") ||
+		!strings.Contains(stream, "\"answer_validation\":\"valid\"") ||
+		strings.Contains(stream, "\"action_suggestion\"") ||
+		assistantActionRowCount(t, h.app.store) != 0 {
+
+		t.Fatalf("ineligible suggestion changed normal answer or persisted action: %s", stream)
+	}
+	var eventCount int
+	if err := h.app.store.db.QueryRow("SELECT COUNT(*) FROM action_events").Scan(&eventCount); err != nil {
+		t.Fatal(err)
+	}
+	if eventCount != 0 {
+		t.Fatalf("ineligible suggestion created %d confirmation/execution events", eventCount)
+	}
+}
+
 func TestStandaloneFreeFormActionLanguageCannotConfirmPendingSuggestion(t *testing.T) {
 	h := newPhase2CTestHarness(t, 12)
 	history, _, err := h.app.store.startHistoryEntry("", "trusted investigation", actionTestTime())
