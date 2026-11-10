@@ -294,7 +294,11 @@ func (a *app) handlePhase2CStreamForHistory(w http.ResponseWriter, r *http.Reque
 		}
 		reasonerCalls = 1
 		reasonerResponse, reasonerErr = a.callOnePassReasonerWithKeepalive(
-			r.Context(), policy.Model, question, result.Packet, result.PacketJSON, nil,
+			r.Context(), policy.Model, question, result.Packet, result.PacketJSON, func() {
+				if r.Context().Err() == nil {
+					writeSSEKeepalive(w, flusher)
+				}
+			},
 		)
 		return nil
 	})

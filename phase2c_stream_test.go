@@ -506,6 +506,7 @@ type concurrencyDetectWriter struct {
 	*httptest.ResponseRecorder
 	active     atomic.Int32
 	concurrent atomic.Bool
+	onWrite    func([]byte)
 }
 
 func (w *concurrencyDetectWriter) Write(value []byte) (int, error) {
@@ -513,6 +514,9 @@ func (w *concurrencyDetectWriter) Write(value []byte) (int, error) {
 		w.concurrent.Store(true)
 	}
 	defer w.active.Store(0)
+	if w.onWrite != nil {
+		w.onWrite(value)
+	}
 	return w.ResponseRecorder.Write(value)
 }
 func (w *concurrencyDetectWriter) Flush() {}
@@ -524,6 +528,145 @@ func TestPhase2CDoesNotWriteResponseConcurrently(t *testing.T) {
 	h.app.handlePhase2CStream(w, r, "Why did the Dell restart yesterday?", nil)
 	if w.concurrent.Load() {
 		t.Fatal("concurrent ResponseWriter use")
+	}
+}
+
+func TestPhase2CSlowReasonerEmitsSSECommentKeepalive(t *testing.T) {
+	const question = "Has MyScheduler had any failures in the last 24 hours?"
+	now := time.Date(2026, 9, 28, 5, 6, 47, 0, time.UTC)
+	configure := func(h *phase2CTestHarness) {
+		h.app.phase2Now = func() time.Time { return now }
+		h.app.phase2Executor = productionApplicationRuntimeTrendExecutor(now)
+		h.responseBuilder = applicationRuntimeTrendNoSuggestionResponse
+	}
+
+	fast := newPhase2CTestHarness(t, 12)
+	configure(fast)
+	wantAnswer := phase2CStreamAnswer(t, fast.runChat(t, "phase2c-keepalive-fast", "", question))
+	if wantAnswer == "" || assistantActionRowCount(t, fast.app.store) != 0 {
+		t.Fatalf("fast-path baseline answer=%q actions=%d", wantAnswer, assistantActionRowCount(t, fast.app.store))
+	}
+
+	h := newPhase2CTestHarness(t, 12)
+	configure(h)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseReasoner := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseReasoner()
+	h.onReasoner = func(request *http.Request) {
+		close(started)
+		select {
+		case <-release:
+		case <-request.Context().Done():
+		}
+	}
+
+	const sessionID = "phase2c-keepalive-slow"
+	sessionNow := time.Now()
+	h.app.sessions = map[string]*session{
+		sessionID: {ID: sessionID, CreatedAt: sessionNow, LastHeartbeat: sessionNow, LastChat: sessionNow},
+	}
+	body, err := json.Marshal(chatRequest{SessionID: sessionID, Message: question})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	request := httptest.NewRequest(
+		http.MethodPost, "/api/v1/chat/stream", strings.NewReader(string(body)),
+	).WithContext(ctx)
+
+	keepaliveSeen := make(chan struct{})
+	var keepaliveOnce sync.Once
+	writer := &concurrencyDetectWriter{
+		ResponseRecorder: httptest.NewRecorder(),
+		onWrite: func(value []byte) {
+			if bytes.Equal(value, []byte(": keepalive\n\n")) {
+				keepaliveOnce.Do(func() { close(keepaliveSeen) })
+			}
+		},
+	}
+	done := make(chan struct{})
+	go func() {
+		h.app.handleChatStream(writer, request)
+		close(done)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Phase 2C reasoner did not start")
+	}
+	select {
+	case <-keepaliveSeen:
+	case <-time.After(agentSSEKeepaliveInterval + 5*time.Second):
+		t.Fatal("Phase 2C did not emit an SSE keepalive while waiting for the reasoner")
+	}
+
+	requests := h.reasonerRequests()
+	if len(requests) != 1 {
+		t.Fatalf("reasoner calls before completion=%d", len(requests))
+	}
+	packet, err := evidencePacketFromReasonerRequest(requests[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reasonerActionSuggestionEligible(packet) {
+		t.Fatalf("keepalive regression did not exercise an action-eligible packet: %+v", packet.Confidence)
+	}
+	if got := assistantActionRowCount(t, h.app.store); got != 0 {
+		t.Fatalf("keepalive persisted %d actions before validated reasoner completion", got)
+	}
+
+	releaseReasoner()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Phase 2C did not finish after the reasoner completed")
+	}
+	if writer.concurrent.Load() {
+		t.Fatal("Phase 2C wrote to the ResponseWriter concurrently")
+	}
+
+	stream := writer.Body.String()
+	comments := 0
+	events := map[string]int{}
+	for _, block := range strings.Split(strings.TrimSpace(stream), "\n\n") {
+		if block == ": keepalive" {
+			comments++
+			continue
+		}
+		if strings.Contains(block, "keepalive") {
+			t.Fatalf("keepalive leaked into an SSE event: %q", block)
+		}
+		if strings.HasPrefix(block, "event: ") {
+			line := strings.SplitN(block, "\n", 2)[0]
+			events[strings.TrimPrefix(line, "event: ")]++
+		}
+	}
+	answer := phase2CStreamAnswer(t, stream)
+	if comments == 0 || events["token"] == 0 || events["done"] != 1 || events["error"] != 0 ||
+		events["action"] != 0 || strings.Contains(stream, "\"action_suggestion\"") ||
+		answer != wantAnswer || strings.Contains(answer, "keepalive") {
+
+		t.Fatalf("comments=%d events=%v answer=%q want=%q stream=%s", comments, events, answer, wantAnswer, stream)
+	}
+	if got := assistantActionRowCount(t, h.app.store); got != 0 {
+		t.Fatalf("keepalive request persisted %d actions", got)
+	}
+	var actionEvents int
+	if err := h.app.store.db.QueryRow("SELECT COUNT(*) FROM action_events").Scan(&actionEvents); err != nil {
+		t.Fatal(err)
+	}
+	if actionEvents != 0 {
+		t.Fatalf("keepalive request created %d action events", actionEvents)
+	}
+	entries := allHistoryEntries(t, h.app.store)
+	if len(entries) != 1 || entries[0].Status != HistoryStatusSucceeded ||
+		entries[0].ResultText != answer || strings.Contains(entries[0].ResultText, "keepalive") {
+
+		t.Fatalf("History finalization changed: %+v", entries)
 	}
 }
 
@@ -780,9 +923,10 @@ func TestPhase2CCancellationRestoresLease(t *testing.T) {
 	h.onReasoner = func(request *http.Request) { close(started); <-request.Context().Done() }
 	ctx, cancel := context.WithCancel(context.Background())
 	r := httptest.NewRequest(http.MethodPost, "/api/v1/chat/stream", nil).WithContext(ctx)
+	w := &concurrencyDetectWriter{ResponseRecorder: httptest.NewRecorder()}
 	done := make(chan struct{})
 	go func() {
-		h.app.handlePhase2CStream(httptest.NewRecorder(), r, "Is the Dell healthy right now?", nil)
+		h.app.handlePhase2CStream(w, r, "Is the Dell healthy right now?", nil)
 		close(done)
 	}()
 	<-started
@@ -797,6 +941,9 @@ func TestPhase2CCancellationRestoresLease(t *testing.T) {
 	}
 	if got := len(h.reasonerRequests()); got != 1 {
 		t.Fatalf("reasoner attempts after cancellation=%d", got)
+	}
+	if w.concurrent.Load() || strings.Contains(w.Body.String(), ": keepalive") {
+		t.Fatalf("canceled request emitted a keepalive or wrote concurrently: %s", w.Body.String())
 	}
 	if got := h.runner.commands(); !reflect.DeepEqual(got, []powerHelperCommand{powerHelperEnter, powerHelperRestore}) {
 		t.Fatalf("commands=%v", got)
