@@ -58,7 +58,7 @@ function record(state, category = '') {
 }
 const flush = async () => { for (let i = 0; i < 12; i++) await new Promise((resolve) => setImmediate(resolve)); };
 
-async function loadPage(server, executeGate = null) {
+async function loadPage(server, executeGate = null, executeResponse = null) {
   const roots = new Map();
   const document = {
     getElementById(id) { if (!roots.has(id)) roots.set(id, new Element('div', true)); return roots.get(id); },
@@ -73,6 +73,7 @@ async function loadPage(server, executeGate = null) {
     if (path.includes('/confirm')) { server.action = record('authorized'); body = server.action; }
     else if (path.includes('/execute')) {
       if (executeGate) await executeGate;
+      if (executeResponse) return executeResponse(server);
       body = server.action;
       status = body.state === 'failed' ? 502 : body.state === 'executing' ? 202 : 200;
     }
@@ -138,5 +139,23 @@ test('actual confirm is authorization only; double execute sends one POST and pr
   page.button('Refresh status').click();
   await flush();
   assert.equal(page.requests.filter((r) => r.method === 'POST').length, 2);
+  assert.equal(page.button('Execute restart'), undefined);
+});
+
+test('a gateway HTML error reconciles durable failure with GET and never retries Execute', async () => {
+  const server = { action: record('authorized') };
+  const page = await loadPage(server, null, () => {
+    server.action = record('failed', 'upstream_rejected');
+    return { ok: false, status: 502, text: async () => '<!DOCTYPE html><title>Bad Gateway</title>' };
+  });
+  page.button('Execute restart').click();
+  await flush();
+  assert.match(page.conversation.textContent, /Restart failed/);
+  assert.match(page.conversation.textContent, /rejected/);
+  assert.doesNotMatch(page.conversation.textContent, /DOCTYPE|Bad Gateway/);
+  assert.deepEqual(page.requests.filter((request) => request.path.startsWith('/api/admin/actions/' + id)), [
+    { method: 'POST', path: '/api/admin/actions/' + id + '/execute' },
+    { method: 'GET', path: '/api/admin/actions/' + id },
+  ]);
   assert.equal(page.button('Execute restart'), undefined);
 });

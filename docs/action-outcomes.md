@@ -66,5 +66,36 @@ code using a small test DOM adapter.
 An earlier-phase defect was corrected: unclassified executor errors can no
 longer claim definitive failure. Only typed evidence of non-execution can do so.
 
-Production deployment and live acceptance must be recorded separately before
-Phase 4D1 is marked complete. Phase 4D2 is not started.
+## Production acceptance checkpoint
+
+November 17, 2026: implementation commit
+`87cd2968fefe5931e257ae6686acde4ccec24927` was deployed after the user completed
+sudo authentication. Schema v4 and all pre-deployment historical row hashes
+were preserved. Backup and old binary remain under
+`/var/lib/miniai/phase4d1-87cd296`.
+
+- Missing-target action `action_34837674e3c5a8c38a90c852484419e3` recorded
+  `failed / upstream_rejected`. GET and browser reload preserved it; duplicate
+  Execute returned 409 without new events.
+- Canary action `action_9bf4f2176b9315bce25d727e2836f953` used the ordinary
+  authenticated direct-user policy. Creation did not restart; separate Execute
+  succeeded. Execute/GET matched, reload preserved the outcome, and duplicate
+  Execute returned 409 without new events. The same canary container was left
+  healthy, with start `2026-11-17T19:59:32.047913331Z`.
+- The public failure response was gateway HTML, not the origin JSON body. A new
+  actual-app frontend regression proves this becomes one GET reconciliation,
+  safe failed rendering, and no repeated Execute. All 9 frontend tests pass.
+  This follow-up changes only tests/documentation, not the deployed implementation.
+- Live ambiguity was intentionally not induced by disrupting production; the
+  real local disconnect/reopen/no-retry integration tests provide that proof.
+- Four bounded read-only investigations produced no assistant action (two
+  validated-answer rejections, one generic truncated answer, one canceled
+  stream). Fresh assistant -> Confirm -> Execute live acceptance remains
+  unproven. The validator and authentication were not weakened to force a pass.
+
+Status is PARTIAL, not phase completion. Automated confirmation separation and
+earlier Phase 4C historical evidence remain intact, but direct-user success is
+not substituted for the missing fresh assistant-flow proof. The ReactorLab
+`PRODUCTION_VERIFICATION.md` and master `REACTORLAB_CONTEXT.md` record the exact
+remaining checks, including the requested final protected-database hash check.
+Phase 4D2 is not started.
