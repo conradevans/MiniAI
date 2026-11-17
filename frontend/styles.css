@@ -211,6 +211,40 @@ details[open] > summary::before { transform: rotate(90deg); }
 .execution-retry { border: 1px solid var(--border); background: var(--panel-2); color: #d6dde5; border-radius: 6px; padding: 4px 8px; cursor: pointer; font-size: 10px; }
 .execution-retry:hover { background: var(--panel-3); color: #fff; }
 
+.action-card {
+  margin-top: 12px;
+  padding: 13px 14px 14px;
+  border: 1px solid #35404b;
+  border-radius: 10px;
+  background: linear-gradient(135deg, rgba(25,31,38,.92), rgba(14,18,23,.92));
+  color: var(--muted);
+  font-size: 11px;
+}
+.action-card-succeeded { border-color: rgba(98,230,148,.35); }
+.action-card-failed { border-color: rgba(255,117,117,.35); }
+.action-card-cancelled { border-color: var(--border-soft); }
+.action-card-label { color: #cfd7df; font-size: 9.5px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+.action-card-title { margin: 6px 0 5px; color: #f3f6f8; font-size: 14px; overflow-wrap: anywhere; }
+.action-card-reason, .action-card-status { margin: 5px 0 0; line-height: 1.5; overflow-wrap: anywhere; }
+.action-card-meta { margin-top: 9px; color: #c6a76a; font-size: 10px; font-weight: 650; }
+.action-card-notice { margin-top: 9px; color: #c6a76a; line-height: 1.45; }
+.action-card-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.action-card-button {
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 7px 10px;
+  color: #e8edf2;
+  background: var(--panel-2);
+  font-size: 10.5px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.action-card-button:hover:not(:disabled) { background: var(--panel-3); border-color: #46515d; }
+.action-card-button:focus-visible { outline: 2px solid #788594; outline-offset: 2px; }
+.action-card-button:disabled { color: var(--muted-2); background: #151a20; cursor: wait; opacity: .72; }
+.action-card-primary { color: #11151a; background: #eef2f5; border-color: #eef2f5; }
+.action-card-primary:hover:not(:disabled) { color: #07090c; background: #fff; border-color: #fff; }
+
 .composer-wrap { position: absolute; left: 0; right: 0; bottom: 0; padding: 22px max(28px, calc((100vw - var(--sidebar) - 850px)/2)) 18px; background: linear-gradient(transparent, var(--bg) 24%, var(--bg) 100%); z-index: 3; }
 .activity-line { width: min(850px, 100%); margin: 0 auto 7px; color: var(--muted); font-size: 11px; display: flex; align-items: center; gap: 8px; padding: 0 5px; }
 .activity-line[hidden] { display: none; }

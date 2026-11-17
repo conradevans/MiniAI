@@ -13,7 +13,12 @@
     liveToolEvents: [],
     historyCache: new Map(),
     historyRequests: new Map(),
+    actionRequests: new Map(),
+    conversationRevision: 0,
   };
+
+  const actionControls = window.MiniAIActionControls || null;
+  const actionCardStates = new WeakMap();
 
   const $ = (id) => document.getElementById(id);
   const els = {
@@ -208,6 +213,7 @@
   }
 
   function clearConversation() {
+    state.conversationRevision += 1;
     els.conversation.querySelectorAll('.message').forEach((el) => el.remove());
     els.emptyState.hidden = false;
   }
@@ -249,10 +255,12 @@
     body.innerHTML = renderMarkdown(content);
     wrap.append(head, body);
     const historyId = String(historyEntryId || '').trim();
+    if (historyId) wrap.dataset.historyId = historyId;
     if (historyId) wrap.appendChild(renderExecutionDetails(historyId));
     else if (evidence.length) wrap.appendChild(renderEvidence(evidence));
     els.conversation.appendChild(wrap);
     wireCopyButtons(wrap);
+    if (historyId) hydrateHistoryActions(wrap, historyId, state.conversationRevision);
     return { wrap, body };
   }
 
@@ -654,15 +662,274 @@
     const historyId = String(stored.history_entry_id || '').trim();
     const evidence = Array.isArray(stored.evidence) ? stored.evidence : [];
     if (historyId) {
+      assistant.wrap.dataset.historyId = historyId;
       assistant.wrap.querySelector('.tool-box')?.remove();
       assistant.wrap.querySelector('.evidence-box')?.remove();
       assistant.wrap.querySelector('.execution-box')?.remove();
       assistant.wrap.appendChild(renderExecutionDetails(historyId));
+      hydrateHistoryActions(assistant.wrap, historyId, state.conversationRevision);
     } else if (evidence.length) {
       assistant.wrap.querySelector('.tool-box')?.remove();
       assistant.wrap.querySelector('.execution-box')?.remove();
       assistant.wrap.appendChild(renderEvidence(evidence));
     }
+  }
+
+  async function fetchHistoryActions(historyId) {
+    if (state.actionRequests.has(historyId)) return state.actionRequests.get(historyId);
+    const request = api('/api/admin/actions?history_id=' + encodeURIComponent(historyId));
+    state.actionRequests.set(historyId, request);
+    try {
+      return await request;
+    } finally {
+      if (state.actionRequests.get(historyId) === request) state.actionRequests.delete(historyId);
+    }
+  }
+
+  async function hydrateHistoryActions(wrap, historyId, revision) {
+    if (!actionControls) return;
+    try {
+      const payload = await fetchHistoryActions(historyId);
+      if (!actionOwnerMatches(wrap, historyId, revision)
+        || payload?.history_id !== historyId
+        || !Array.isArray(payload?.actions)) return;
+
+      for (const value of payload.actions) {
+        const action = actionControls.restoredAction(value, historyId);
+        if (action) upsertActionCard(wrap, action);
+      }
+    } catch (error) {
+      if (!actionOwnerMatches(wrap, historyId, revision)) return;
+      if (error.status === 401 || error.status === 403) markActionCardsAccessRequired(wrap);
+    }
+  }
+
+  function actionOwnerMatches(wrap, historyId, revision) {
+    return wrap?.isConnected
+      && wrap.dataset.historyId === historyId
+      && state.conversationRevision === revision;
+  }
+
+  function markActionCardsAccessRequired(wrap) {
+    for (const card of wrap.querySelectorAll('.action-card')) {
+      const cardState = actionCardStates.get(card);
+      if (!cardState) continue;
+      cardState.accessRequired = true;
+      cardState.notice = 'Administrator access is required to manage this action.';
+      renderActionCard(card);
+    }
+  }
+
+  function upsertActionCard(wrap, action, reason = '') {
+    if (!wrap?.isConnected || !actionControls) return null;
+    let card = Array.from(wrap.querySelectorAll('.action-card'))
+      .find((candidate) => candidate.dataset.actionId === action.action_id);
+    if (!card) {
+      card = document.createElement('section');
+      card.className = 'action-card';
+      card.dataset.actionId = action.action_id;
+      const reference = wrap.querySelector('.tool-box, .evidence-box, .execution-box');
+      if (reference) wrap.insertBefore(card, reference);
+      else wrap.appendChild(card);
+    }
+
+    const previous = actionCardStates.get(card);
+    if (previous?.pending) return card;
+    const safeReason = typeof reason === 'string' && reason.trim()
+      ? reason.trim()
+      : (previous?.reason || 'MiniAI recommended this restart during the investigation.');
+    actionCardStates.set(card, {
+      action,
+      reason: safeReason,
+      pending: false,
+      accessRequired: false,
+      notice: '',
+      refreshAvailable: false,
+    });
+    renderActionCard(card);
+    return card;
+  }
+
+  function renderActionCard(card) {
+    const cardState = actionCardStates.get(card);
+    if (!cardState || !actionControls) return;
+    const action = cardState.action;
+    const presentation = actionControls.presentationFor(action);
+    if (!presentation) return;
+    card.className = 'action-card action-card-' + action.state;
+    card.replaceChildren();
+
+    card.appendChild(makeElement('div', 'action-card-label', presentation.label));
+    card.appendChild(makeElement('h3', 'action-card-title', 'Restart ' + action.target.id));
+    if (cardState.reason) {
+      card.appendChild(makeElement('p', 'action-card-reason', cardState.reason));
+    }
+    if (presentation.status) {
+      card.appendChild(makeElement('p', 'action-card-status', presentation.status));
+    }
+    if (action.state === 'awaiting_confirmation') {
+      card.appendChild(makeElement('div', 'action-card-meta', 'Confirmation required · Recoverable'));
+    }
+    if (cardState.notice) {
+      const notice = makeElement('div', 'action-card-notice', cardState.notice);
+      notice.setAttribute('role', 'status');
+      card.appendChild(notice);
+    }
+
+    const controls = actionControls.controlsFor(action);
+    if (controls.length || cardState.refreshAvailable) {
+      const actions = makeElement('div', 'action-card-actions');
+      for (const control of controls) {
+        if (control === 'confirm') {
+          actions.appendChild(actionButton('Confirm restart', 'action-card-primary', cardState.pending, () => confirmAction(card)));
+        } else if (control === 'dismiss') {
+          actions.appendChild(actionButton('Dismiss', 'action-card-secondary', cardState.pending, () => dismissAction(card)));
+        } else if (control === 'execute') {
+          actions.appendChild(actionButton('Execute restart', 'action-card-primary', cardState.pending, () => executeAction(card)));
+        }
+      }
+      if (cardState.refreshAvailable) {
+        actions.appendChild(actionButton('Refresh status', 'action-card-secondary', cardState.pending, () => refreshActionCard(card)));
+      }
+      card.appendChild(actions);
+    }
+  }
+
+  function actionButton(label, className, disabled, handler) {
+    const button = makeElement('button', 'action-card-button ' + className, label);
+    button.type = 'button';
+    button.disabled = disabled;
+    button.addEventListener('click', handler);
+    return button;
+  }
+
+  function confirmAction(card) {
+    const action = actionCardStates.get(card)?.action;
+    const request = actionControls?.requestFor('confirm', action?.action_id);
+    if (request) submitActionMutation(card, request, 'Confirming restart…');
+  }
+
+  function dismissAction(card) {
+    const action = actionCardStates.get(card)?.action;
+    const request = actionControls?.requestFor('dismiss', action?.action_id);
+    if (request) submitActionMutation(card, request, 'Dismissing recommendation…');
+  }
+
+  function executeAction(card) {
+    const action = actionCardStates.get(card)?.action;
+    const request = actionControls?.requestFor('execute', action?.action_id);
+    if (request) submitActionMutation(card, request, 'Executing authorized restart…');
+  }
+
+  async function submitActionMutation(card, request, pendingMessage) {
+    const cardState = actionCardStates.get(card);
+    if (!cardState || cardState.pending) return;
+    const revision = state.conversationRevision;
+    cardState.pending = true;
+    cardState.notice = pendingMessage;
+    cardState.accessRequired = false;
+    cardState.refreshAvailable = false;
+    renderActionCard(card);
+
+    try {
+      const body = await adminActionFetch(request);
+      if (!applyAuthoritativeAction(card, cardState, body)) {
+        const error = new Error('Action state could not be verified.');
+        error.ambiguous = true;
+        throw error;
+      }
+    } catch (error) {
+      if (!actionCardStillCurrent(card, cardState, revision)) return;
+      if (applyAuthoritativeAction(card, cardState, error.body)) {
+        // Execution failures can carry a final authoritative action response.
+      } else if (error.status === 401 || error.status === 403) {
+        cardState.accessRequired = true;
+        cardState.notice = 'Administrator access is required to manage this action.';
+      } else if (error.status === 409 || !error.status || error.status >= 500 || error.ambiguous) {
+        await reconcileActionCard(card, cardState, revision);
+      } else {
+        cardState.notice = 'The action request was not accepted. Refresh the action state before trying again.';
+        cardState.refreshAvailable = true;
+      }
+    } finally {
+      if (actionCardStillCurrent(card, cardState, revision)) {
+        cardState.pending = false;
+        renderActionCard(card);
+      }
+    }
+  }
+
+  async function refreshActionCard(card) {
+    const cardState = actionCardStates.get(card);
+    if (!cardState || cardState.pending) return;
+    const revision = state.conversationRevision;
+    cardState.pending = true;
+    cardState.notice = 'Refreshing action state…';
+    cardState.refreshAvailable = false;
+    renderActionCard(card);
+    await reconcileActionCard(card, cardState, revision);
+    if (actionCardStillCurrent(card, cardState, revision)) {
+      cardState.pending = false;
+      renderActionCard(card);
+    }
+  }
+
+  async function reconcileActionCard(card, cardState, revision) {
+    try {
+      const body = await adminActionFetch({
+        method: 'GET',
+        path: '/api/admin/actions/' + encodeURIComponent(cardState.action.action_id),
+        body: '',
+      });
+      if (!actionCardStillCurrent(card, cardState, revision)) return;
+      if (!applyAuthoritativeAction(card, cardState, body)) throw new Error('invalid action response');
+    } catch (error) {
+      if (!actionCardStillCurrent(card, cardState, revision)) return;
+      if (error.status === 401 || error.status === 403) {
+        cardState.accessRequired = true;
+        cardState.notice = 'Administrator access is required to manage this action.';
+      } else {
+        cardState.notice = 'Action state could not be verified. Refresh status before trying again.';
+        cardState.refreshAvailable = true;
+      }
+    }
+  }
+
+  function applyAuthoritativeAction(card, cardState, value) {
+    const historyId = card.closest('.message.assistant')?.dataset.historyId || '';
+    const action = actionControls?.restoredAction(value, historyId);
+    if (!action || action.action_id !== cardState.action.action_id) return false;
+    cardState.action = action;
+    cardState.accessRequired = false;
+    cardState.notice = '';
+    cardState.refreshAvailable = false;
+    return true;
+  }
+
+  function actionCardStillCurrent(card, cardState, revision) {
+    return card?.isConnected
+      && actionCardStates.get(card) === cardState
+      && card.dataset.actionId === cardState.action.action_id
+      && state.conversationRevision === revision;
+  }
+
+  async function adminActionFetch(request) {
+    const options = { method: request.method, cache: 'no-store' };
+    if (request.body) {
+      options.headers = { 'Content-Type': 'application/json' };
+      options.body = request.body;
+    }
+    const response = await fetch(request.path, options);
+    const text = await response.text();
+    let body = null;
+    try { body = text ? JSON.parse(text) : null; } catch { body = { error: text }; }
+    if (!response.ok) {
+      const error = new Error(body?.error || 'Action request failed (' + response.status + ')');
+      error.status = response.status;
+      error.body = body;
+      throw error;
+    }
+    return body;
   }
 
   function renderLiveTools(container, events) {
@@ -771,6 +1038,9 @@
         }
         if (eventName === 'error') throw new Error(data.error || 'MiniAI error');
         if (eventName === 'done') {
+          actionControls?.consumeDoneAction(data, (suggestion) => {
+            upsertActionCard(assistant.wrap, suggestion, suggestion.reason);
+          });
           stopActivity();
           const tps = data.tokens_per_second;
           els.modelHint.textContent = tps ? `${data.model} · ${tps} tok/s` : `${data.model || 'Local model'} · complete`;

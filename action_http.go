@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -63,16 +64,64 @@ type adminActionEventsResponse struct {
 	Events   []adminActionEventResponse `json:"events"`
 }
 
+type adminHistoryActionsResponse struct {
+	HistoryID string                `json:"history_id"`
+	Actions   []adminActionResponse `json:"actions"`
+}
+
 func (a *app) registerAdminActionRoutes(
 	mux *http.ServeMux,
 	restartExecutor RestartApplicationExecutor,
 ) {
 	mux.HandleFunc("POST /api/admin/actions", a.handleCreateAdminAction)
+	mux.HandleFunc("GET /api/admin/actions", a.handleGetAdminHistoryActions)
 	mux.HandleFunc("GET /api/admin/actions/{action_id}", a.handleGetAdminAction)
 	mux.HandleFunc("GET /api/admin/actions/{action_id}/events", a.handleGetAdminActionEvents)
 	mux.HandleFunc("POST /api/admin/actions/{action_id}/confirm", a.handleConfirmAdminAction)
 	mux.HandleFunc("POST /api/admin/actions/{action_id}/cancel", a.handleCancelAdminAction)
 	mux.HandleFunc("POST /api/admin/actions/{action_id}/execute", a.handleExecuteAdminRestart(restartExecutor))
+}
+
+func (a *app) handleGetAdminHistoryActions(w http.ResponseWriter, r *http.Request) {
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil || len(query) != 1 {
+		writeError(w, http.StatusBadRequest, "invalid History action request")
+		return
+	}
+	historyIDs, ok := query["history_id"]
+	if !ok || len(historyIDs) != 1 || !validHistoryOpaqueID(historyIDs[0]) {
+		writeError(w, http.StatusBadRequest, "invalid History action request")
+		return
+	}
+	historyID := historyIDs[0]
+	ids, err := a.store.historyActionProposalIDs(historyID)
+	if errors.Is(err, errActionHistoryLink) {
+		writeError(w, http.StatusNotFound, "History entry not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not read History actions")
+		return
+	}
+
+	response := adminHistoryActionsResponse{
+		HistoryID: historyID,
+		Actions:   make([]adminActionResponse, 0, len(ids)),
+	}
+	for _, id := range ids {
+		record, loadErr := a.store.getActionProposal(id)
+		if loadErr != nil {
+			writeError(w, http.StatusInternalServerError, "could not read History actions")
+			return
+		}
+		action, responseErr := newAdminActionResponse(record)
+		if responseErr != nil || action.HistoryEntryID != historyID {
+			writeError(w, http.StatusInternalServerError, "could not read History actions")
+			return
+		}
+		response.Actions = append(response.Actions, action)
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (a *app) handleCreateAdminAction(w http.ResponseWriter, r *http.Request) {
