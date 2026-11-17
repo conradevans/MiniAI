@@ -12,6 +12,7 @@ const (
 	RestorationEventExecutionStarted           RestorationEventType = "execution_started"
 	RestorationEventExecutionSucceeded         RestorationEventType = "execution_succeeded"
 	RestorationEventExecutionFailed            RestorationEventType = "execution_failed"
+	RestorationEventExecutionOutcomeUnknown    RestorationEventType = "execution_outcome_unknown"
 )
 
 type ExecutionFailureCategory string
@@ -159,6 +160,17 @@ func validateRestorationEvents(
 				FromState:       ActionStateExecuting,
 				ToState:         ActionStateFailed,
 				FailureCategory: events[len(expected)].FailureCategory,
+			})
+		} else if len(events) == len(expected)+1 {
+			category := events[len(expected)].FailureCategory
+			if !ValidExecutionFailureCategory(category) {
+				return ErrActionAuditMismatch
+			}
+			expected = append(expected, RestorationEvent{
+				Type:            RestorationEventExecutionOutcomeUnknown,
+				FromState:       ActionStateExecuting,
+				ToState:         ActionStateExecuting,
+				FailureCategory: category,
 			})
 		}
 	default:

@@ -47,8 +47,7 @@ func (s *chatStore) beginRestartApplicationExecution(
 			errActionExecutionNotAllowed,
 		)
 	}
-	transitioned, err := transitionActionProposal(record.Proposal, ActionStateExecuting)
-	if err != nil {
+	if _, err := transitionActionProposal(record.Proposal, ActionStateExecuting); err != nil {
 		return storedActionProposal{}, fmt.Errorf("%w: %v", errActionExecutionNotAllowed, err)
 	}
 	now := actionExecutionTimestamp(record.UpdatedAt)
@@ -82,9 +81,7 @@ func (s *chatStore) beginRestartApplicationExecution(
 	if err := tx.Commit(); err != nil {
 		return storedActionProposal{}, err
 	}
-	record.Proposal = transitioned
-	record.UpdatedAt = now
-	return record, nil
+	return s.getActionProposal(proposal.ID())
 }
 
 func (s *chatStore) completeRestartApplicationSuccess(
@@ -105,15 +102,14 @@ func (s *chatStore) completeRestartApplicationSuccess(
 	}
 	if err := actiondomain.ValidateRestartExecutionFoundation(record.Proposal); err != nil ||
 		!record.SupportsExecution ||
-		record.Proposal.State() != ActionStateExecuting {
+		record.Proposal.State() != ActionStateExecuting || record.OutcomeRecordedAt != nil {
 
 		return storedActionProposal{}, fmt.Errorf(
 			"%w: action is not executing",
 			errActionExecutionCompletionNotAllowed,
 		)
 	}
-	transitioned, err := transitionActionProposal(record.Proposal, ActionStateSucceeded)
-	if err != nil {
+	if _, err := transitionActionProposal(record.Proposal, ActionStateSucceeded); err != nil {
 		return storedActionProposal{}, fmt.Errorf(
 			"%w: %v",
 			errActionExecutionCompletionNotAllowed,
@@ -151,9 +147,7 @@ func (s *chatStore) completeRestartApplicationSuccess(
 	if err := tx.Commit(); err != nil {
 		return storedActionProposal{}, err
 	}
-	record.Proposal = transitioned
-	record.UpdatedAt = now
-	return record, nil
+	return s.getActionProposal(id)
 }
 
 func (s *chatStore) completeRestartApplicationFailure(
@@ -181,15 +175,14 @@ func (s *chatStore) completeRestartApplicationFailure(
 	}
 	if err := actiondomain.ValidateRestartExecutionFoundation(record.Proposal); err != nil ||
 		!record.SupportsExecution ||
-		record.Proposal.State() != ActionStateExecuting {
+		record.Proposal.State() != ActionStateExecuting || record.OutcomeRecordedAt != nil {
 
 		return storedActionProposal{}, fmt.Errorf(
 			"%w: action is not executing",
 			errActionExecutionCompletionNotAllowed,
 		)
 	}
-	transitioned, err := transitionActionProposal(record.Proposal, ActionStateFailed)
-	if err != nil {
+	if _, err := transitionActionProposal(record.Proposal, ActionStateFailed); err != nil {
 		return storedActionProposal{}, fmt.Errorf(
 			"%w: %v",
 			errActionExecutionCompletionNotAllowed,
@@ -228,9 +221,43 @@ func (s *chatStore) completeRestartApplicationFailure(
 	if err := tx.Commit(); err != nil {
 		return storedActionProposal{}, err
 	}
-	record.Proposal = transitioned
-	record.UpdatedAt = now
-	return record, nil
+	return s.getActionProposal(id)
+}
+
+func (s *chatStore) recordRestartApplicationUnknown(id ActionID, category ActionExecutionFailureCategory) (storedActionProposal, error) {
+	if !actiondomain.ValidExecutionFailureCategory(category) {
+		return storedActionProposal{}, errActionExecutionCompletionNotAllowed
+	}
+	eventID, err := newActionEventID()
+	if err != nil {
+		return storedActionProposal{}, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return storedActionProposal{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	record, events, err := loadActionProposal(tx, id)
+	if err != nil {
+		return storedActionProposal{}, err
+	}
+	if err := actiondomain.ValidateRestartExecutionFoundation(record.Proposal); err != nil ||
+		!record.SupportsExecution || record.Proposal.State() != ActionStateExecuting || record.OutcomeRecordedAt != nil {
+		return storedActionProposal{}, errActionExecutionCompletionNotAllowed
+	}
+	now := actionExecutionTimestamp(record.UpdatedAt)
+	if _, err := tx.Exec(`INSERT INTO action_events(event_id, action_id, ordinal, event_type, from_state, to_state, failure_category, created_at)
+		VALUES(?,?,?,?,?,?,?,?)`, eventID, id, len(events), ActionEventExecutionOutcomeUnknown,
+		ActionStateExecuting, ActionStateExecuting, category, encodeDBTime(now)); err != nil {
+		return storedActionProposal{}, err
+	}
+	if _, err := tx.Exec(`UPDATE action_proposals SET updated_at = ? WHERE action_id = ?`, encodeDBTime(now), id); err != nil {
+		return storedActionProposal{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return storedActionProposal{}, err
+	}
+	return s.getActionProposal(id)
 }
 
 func sameRestartExecutionProposal(left, right ActionProposal) bool {

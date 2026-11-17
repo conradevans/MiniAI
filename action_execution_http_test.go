@@ -62,7 +62,7 @@ func TestAdminActionExecuteAuthenticatedSuccessAndExplicitSeparation(t *testing.
 	)
 	loaded := decodeAdminActionHTTPResponse(t, getResponse)
 	if getResponse.Code != http.StatusOK || loaded.State != ActionStateSucceeded ||
-		loaded.ExecutionOutcome != "" || loaded.FailureCategory != "" {
+		loaded.ExecutionOutcome != RestartApplicationExecutionSucceeded || loaded.FailureCategory != "" {
 
 		t.Fatalf("loaded restart status=%d action=%+v", getResponse.Code, loaded)
 	}
@@ -140,7 +140,7 @@ func TestAdminActionExecuteDefinitiveMiniDeployRejectionIsSafe(t *testing.T) {
 	)
 	loaded := decodeAdminActionHTTPResponse(t, getResponse)
 	if getResponse.Code != http.StatusOK || loaded.State != ActionStateFailed ||
-		loaded.ExecutionOutcome != "" || loaded.FailureCategory != "" {
+		loaded.ExecutionOutcome != RestartApplicationExecutionFailed || loaded.FailureCategory != ActionExecutionFailureUpstreamRejected {
 
 		t.Fatalf("loaded failed action status=%d action=%+v", getResponse.Code, loaded)
 	}
@@ -229,7 +229,7 @@ func TestAdminActionExecuteAmbiguousMiniDeployResponseIsSafeAndNotRetried(t *tes
 	)
 	loaded := decodeAdminActionHTTPResponse(t, getResponse)
 	if getResponse.Code != http.StatusOK || loaded.State != ActionStateExecuting ||
-		loaded.ExecutionOutcome != "" || loaded.FailureCategory != "" {
+		loaded.ExecutionOutcome != RestartApplicationExecutionOutcomeUnknown || loaded.FailureCategory != ActionExecutionFailureUpstreamRejected {
 
 		t.Fatalf("loaded ambiguous action status=%d action=%+v", getResponse.Code, loaded)
 	}
@@ -259,6 +259,7 @@ func TestAdminActionExecuteAmbiguousMiniDeployResponseIsSafeAndNotRetried(t *tes
 		events,
 		ActionEventPolicyAuthorizedOnCreation,
 		ActionEventExecutionStarted,
+		ActionEventExecutionOutcomeUnknown,
 	)
 	if events.Events[1].FailureCategory != "" ||
 		strings.Contains(eventsResponse.Body.String(), "private uncertain upstream failure") {

@@ -39,6 +39,7 @@ func (boundary adminSecurityBoundary) requireAdmin(next http.Handler) http.Handl
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
 		rawToken := strings.TrimSpace(r.Header.Get(adminAccessJWTHeader))
 		if rawToken == "" {
 			http.Error(w, "administrator authentication required", http.StatusUnauthorized)

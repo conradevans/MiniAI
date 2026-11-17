@@ -44,6 +44,9 @@ type adminActionResponse struct {
 	SupportsExecution    bool                               `json:"supports_execution"`
 	ExecutionOutcome     RestartApplicationExecutionOutcome `json:"execution_outcome,omitempty"`
 	FailureCategory      ActionExecutionFailureCategory     `json:"failure_category,omitempty"`
+	ExecutionStartedAt   *time.Time                         `json:"execution_started_at,omitempty"`
+	ExecutionCompletedAt *time.Time                         `json:"execution_completed_at,omitempty"`
+	OutcomeRecordedAt    *time.Time                         `json:"outcome_recorded_at,omitempty"`
 	CreatedAt            time.Time                          `json:"created_at"`
 	UpdatedAt            time.Time                          `json:"updated_at"`
 	HistoryEntryID       string                             `json:"history_id,omitempty"`
@@ -317,8 +320,7 @@ func writeAdminActionExecutionResponse(
 		writeError(w, http.StatusInternalServerError, "could not read action")
 		return
 	}
-	response.ExecutionOutcome = result.Outcome
-	response.FailureCategory = result.FailureCategory
+	// Execute, GET and History all project the same validated durable record.
 	writeJSON(w, status, response)
 }
 
@@ -446,6 +448,11 @@ func newAdminActionResponse(record storedActionProposal) (adminActionResponse, e
 		CreatedAt:            proposal.CreatedAt().UTC(),
 		UpdatedAt:            record.UpdatedAt.UTC(),
 		HistoryEntryID:       record.HistoryEntryID,
+		ExecutionOutcome:     record.ExecutionOutcome,
+		FailureCategory:      record.FailureCategory,
+		ExecutionStartedAt:   record.ExecutionStartedAt,
+		ExecutionCompletedAt: record.ExecutionCompletedAt,
+		OutcomeRecordedAt:    record.OutcomeRecordedAt,
 	}, nil
 }
 

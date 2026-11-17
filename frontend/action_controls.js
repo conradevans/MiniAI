@@ -18,6 +18,28 @@
     'failed',
     'cancelled',
   ]);
+  const failureMessages = Object.freeze({
+    upstream_unavailable: 'MiniDeploy could not be reached before the restart was sent.',
+    upstream_rejected: 'MiniDeploy rejected the restart request.',
+    timeout: 'The restart request timed out before it could be completed.',
+    invalid_response: 'MiniDeploy did not return a usable restart result.',
+    internal_error: 'MiniAI could not record a confirmed restart result.',
+  });
+
+  function executionFields(value) {
+    const expected = { succeeded: 'succeeded', failed: 'failed', executing: 'outcome_unknown' }[value.state] || '';
+    if (value.execution_outcome && value.execution_outcome !== expected) return null;
+    if (value.failure_category && !Object.hasOwn(failureMessages, value.failure_category)) return null;
+    if (value.failure_category && expected !== 'failed' && expected !== 'outcome_unknown') return null;
+    const fields = { execution_outcome: expected, failure_category: value.failure_category || '' };
+    for (const key of ['execution_started_at', 'execution_completed_at', 'outcome_recorded_at', 'updated_at']) {
+      if (value[key] !== undefined) {
+        if (typeof value[key] !== 'string' || !Number.isFinite(Date.parse(value[key]))) return null;
+        fields[key] = value[key];
+      }
+    }
+    return fields;
+  }
 
   function supportedBase(value) {
     return value && typeof value === 'object' && !Array.isArray(value)
@@ -70,8 +92,11 @@
       return null;
     }
     if (expectedHistoryID && value.history_id !== expectedHistoryID) return null;
+    const execution = executionFields(value);
+    if (!execution) return null;
     return {
       ...normalizedBase(value),
+      ...execution,
       origin: value.origin,
       safety_class: value.safety_class,
       history_id: value.history_id,
@@ -86,11 +111,11 @@
       case 'authorized':
         return { label: 'Restart authorized', status: 'The restart is authorized but has not run yet.' };
       case 'executing':
-        return { label: 'Restart in progress', status: 'The authorized restart is currently running.' };
+        return { label: 'Restart outcome unknown', status: 'MiniAI cannot confirm whether the restart completed. Refresh status to check the recorded result. The restart will not be sent again.' };
       case 'succeeded':
         return { label: 'Restart completed', status: 'The restart completed successfully.' };
       case 'failed':
-        return { label: 'Restart failed', status: 'The restart did not complete successfully.' };
+        return { label: 'Restart failed', status: failureMessages[action.failure_category] || 'The restart did not complete successfully.' };
       case 'cancelled':
         return { label: 'Restart dismissed', status: 'This recommendation was dismissed.' };
       default:
@@ -102,12 +127,16 @@
     if (!supportedBase(action)) return [];
     if (action.state === 'awaiting_confirmation') return ['confirm', 'dismiss'];
     if (action.state === 'authorized') return ['execute'];
+    if (action.state === 'executing') return ['refresh'];
     return [];
   }
 
   function requestFor(control, actionID) {
     if (!actionIDPattern.test(actionID || '')) return null;
     const base = `/api/admin/actions/${encodeURIComponent(actionID)}`;
+    if (control === 'refresh') {
+      return { method: 'GET', path: base, body: '' };
+    }
     if (control === 'confirm') {
       return { method: 'POST', path: `${base}/confirm`, body: '{"confirm":true}' };
     }

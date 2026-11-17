@@ -73,8 +73,8 @@ func (executor RestartApplicationExecutor) Execute(
 	}
 
 	// There is deliberately no retry after the durable executing transition.
-	// A crash or ambiguous transport result leaves the action executing for a
-	// later reconciliation phase, avoiding an accidental second restart.
+	// A crash or ambiguous transport result leaves the action executing with
+	// an unknown outcome. Read-only refresh never redispatches the request.
 	restartErr := executor.restarter.RestartApplication(
 		ctx,
 		executing.Proposal.Target().ID,
@@ -84,10 +84,7 @@ func (executor RestartApplicationExecutor) Execute(
 			executing.Proposal.ID(),
 		)
 		if err != nil {
-			return RestartApplicationExecutionResult{
-				Action:  executing,
-				Outcome: RestartApplicationExecutionOutcomeUnknown,
-			}, err
+			return executor.recordUnknown(executing, ActionExecutionFailureInternalError, err)
 		}
 		return RestartApplicationExecutionResult{
 			Action:  succeeded,
@@ -97,26 +94,18 @@ func (executor RestartApplicationExecutor) Execute(
 
 	failure := classifyMiniDeployRestartFailure(restartErr)
 	if !failure.outcomeKnown {
-		return RestartApplicationExecutionResult{
-			Action:          executing,
-			Outcome:         RestartApplicationExecutionOutcomeUnknown,
-			FailureCategory: failure.category,
-		}, fmt.Errorf(
+		return executor.recordUnknown(executing, failure.category, fmt.Errorf(
 			"%w: %s",
 			errRestartApplicationOutcomeUnknown,
 			failure.category,
-		)
+		))
 	}
 	failed, err := executor.store.completeRestartApplicationFailure(
 		executing.Proposal.ID(),
 		failure.category,
 	)
 	if err != nil {
-		return RestartApplicationExecutionResult{
-			Action:          executing,
-			Outcome:         RestartApplicationExecutionOutcomeUnknown,
-			FailureCategory: failure.category,
-		}, err
+		return executor.recordUnknown(executing, ActionExecutionFailureInternalError, err)
 	}
 	return RestartApplicationExecutionResult{
 		Action:          failed,
@@ -127,4 +116,17 @@ func (executor RestartApplicationExecutor) Execute(
 		errRestartApplicationExecutionFailed,
 		failure.category,
 	)
+}
+
+func (executor RestartApplicationExecutor) recordUnknown(executing storedActionProposal, category ActionExecutionFailureCategory, cause error) (RestartApplicationExecutionResult, error) {
+	record, err := executor.store.recordRestartApplicationUnknown(executing.Proposal.ID(), category)
+	if err != nil {
+		// Even if storage is unavailable, the committed execution_started record
+		// projects as unknown on GET/reopen. Never claim terminal certainty.
+		record = executing
+	}
+	return RestartApplicationExecutionResult{
+		Action: record, Outcome: RestartApplicationExecutionOutcomeUnknown,
+		FailureCategory: record.FailureCategory,
+	}, errors.Join(errRestartApplicationOutcomeUnknown, cause, err)
 }

@@ -99,7 +99,7 @@ test('controls follow authoritative state without implicit transitions', () => {
 
   for (const state of ['executing', 'succeeded', 'failed', 'cancelled']) {
     const action = controls.restoredAction(restoredAction(state), historyID);
-    assert.deepEqual(controls.controlsFor(action), []);
+    assert.deepEqual(controls.controlsFor(action), state === 'executing' ? ['refresh'] : []);
     assert.ok(controls.presentationFor(action));
   }
 });
@@ -118,4 +118,45 @@ test('restored actions remain bound to their History owner and assistant policy'
   assert.equal(controls.restoredAction(restoredAction('authorized', {
     supports_execution: false,
   }), historyID), null);
+});
+
+test('unknown outcome and safe categories survive GET and History restoration', () => {
+  const wire = restoredAction('executing', {
+    execution_outcome: 'outcome_unknown', failure_category: 'timeout',
+    execution_started_at: '2026-11-17T10:00:00Z',
+    outcome_recorded_at: '2026-11-17T10:02:00Z',
+  });
+  const first = controls.restoredAction(wire, historyID);
+  const reload = controls.restoredAction(JSON.parse(JSON.stringify(wire)), historyID);
+  assert.deepEqual(first, reload);
+  assert.equal(reload.execution_outcome, 'outcome_unknown');
+  assert.equal(reload.failure_category, 'timeout');
+  assert.equal(reload.execution_started_at, wire.execution_started_at);
+  assert.match(controls.presentationFor(reload).label, /unknown/);
+  assert.match(controls.presentationFor(reload).status, /cannot confirm/);
+  assert.deepEqual(controls.controlsFor(reload), ['refresh']);
+  assert.deepEqual(controls.requestFor('refresh', actionID), {
+    method: 'GET', path: '/api/admin/actions/' + actionID, body: '',
+  });
+  assert.equal(controls.requestFor('retry', actionID), null);
+  // A fresh target observation is not an execution receipt.
+  const running = controls.restoredAction({ ...wire, target_status: 'running' }, historyID);
+  assert.equal(running.execution_outcome, 'outcome_unknown');
+  assert.doesNotMatch(controls.presentationFor(running).status, /completed successfully/);
+});
+
+test('failed cards explain closed categories and reject conflicting execution truth', () => {
+  const action = controls.restoredAction(restoredAction('failed', {
+    execution_outcome: 'failed', failure_category: 'upstream_rejected',
+  }), historyID);
+  assert.equal(controls.presentationFor(action).label, 'Restart failed');
+  assert.match(controls.presentationFor(action).status, /rejected/);
+  assert.deepEqual(controls.controlsFor(action), []);
+  for (const fields of [
+    { execution_outcome: 'succeeded' },
+    { failure_category: '<script>private error</script>' },
+    { execution_started_at: 'bad' },
+  ]) {
+    assert.equal(controls.restoredAction(restoredAction('executing', fields), historyID), null);
+  }
 });

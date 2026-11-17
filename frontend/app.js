@@ -735,6 +735,8 @@
 
     const previous = actionCardStates.get(card);
     if (previous?.pending) return card;
+    if (previous?.action.updated_at && action.updated_at
+      && Date.parse(action.updated_at) < Date.parse(previous.action.updated_at)) return card;
     const safeReason = typeof reason === 'string' && reason.trim()
       ? reason.trim()
       : (previous?.reason || 'MiniAI recommended this restart during the investigation.');
@@ -786,9 +788,11 @@
           actions.appendChild(actionButton('Dismiss', 'action-card-secondary', cardState.pending, () => dismissAction(card)));
         } else if (control === 'execute') {
           actions.appendChild(actionButton('Execute restart', 'action-card-primary', cardState.pending, () => executeAction(card)));
+        } else if (control === 'refresh') {
+          actions.appendChild(actionButton('Refresh status', 'action-card-secondary', cardState.pending, () => refreshActionCard(card)));
         }
       }
-      if (cardState.refreshAvailable) {
+      if (cardState.refreshAvailable && !controls.includes('refresh')) {
         actions.appendChild(actionButton('Refresh status', 'action-card-secondary', cardState.pending, () => refreshActionCard(card)));
       }
       card.appendChild(actions);
@@ -833,6 +837,7 @@
 
     try {
       const body = await adminActionFetch(request);
+      if (!actionCardStillCurrent(card, cardState, revision)) return;
       if (!applyAuthoritativeAction(card, cardState, body)) {
         const error = new Error('Action state could not be verified.');
         error.ambiguous = true;
@@ -876,11 +881,7 @@
 
   async function reconcileActionCard(card, cardState, revision) {
     try {
-      const body = await adminActionFetch({
-        method: 'GET',
-        path: '/api/admin/actions/' + encodeURIComponent(cardState.action.action_id),
-        body: '',
-      });
+      const body = await adminActionFetch(actionControls.requestFor('refresh', cardState.action.action_id));
       if (!actionCardStillCurrent(card, cardState, revision)) return;
       if (!applyAuthoritativeAction(card, cardState, body)) throw new Error('invalid action response');
     } catch (error) {

@@ -172,7 +172,8 @@ func classifyMiniDeployRestartFailure(err error) miniDeployRestartFailure {
 		return failure
 	}
 	return miniDeployRestartFailure{
-		category:     ActionExecutionFailureInternalError,
-		outcomeKnown: true,
+		category: ActionExecutionFailureInternalError,
+		// An unclassified executor error cannot prove that no mutation occurred.
+		outcomeKnown: false,
 	}
 }

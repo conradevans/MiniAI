@@ -25,6 +25,7 @@ const (
 	ActionEventExecutionStarted           = actiondomain.RestorationEventExecutionStarted
 	ActionEventExecutionSucceeded         = actiondomain.RestorationEventExecutionSucceeded
 	ActionEventExecutionFailed            = actiondomain.RestorationEventExecutionFailed
+	ActionEventExecutionOutcomeUnknown    = actiondomain.RestorationEventExecutionOutcomeUnknown
 )
 
 type actionProposalCreateInput struct {
@@ -37,10 +38,15 @@ type actionProposalCreateInput struct {
 }
 
 type storedActionProposal struct {
-	Proposal          ActionProposal
-	HistoryEntryID    string
-	SupportsExecution bool
-	UpdatedAt         time.Time
+	Proposal             ActionProposal
+	HistoryEntryID       string
+	SupportsExecution    bool
+	UpdatedAt            time.Time
+	ExecutionOutcome     RestartApplicationExecutionOutcome
+	FailureCategory      ActionExecutionFailureCategory
+	ExecutionStartedAt   *time.Time
+	ExecutionCompletedAt *time.Time
+	OutcomeRecordedAt    *time.Time
 }
 
 type ActionEvent struct {
@@ -570,12 +576,34 @@ func loadActionProposal(
 			errors.New("stored policy metadata does not match authoritative policy"),
 		)
 	}
-	return storedActionProposal{
+	record := storedActionProposal{
 		Proposal:          proposal,
 		HistoryEntryID:    historyEntryID.String,
 		SupportsExecution: supportsExecution,
 		UpdatedAt:         updatedAt,
-	}, events, nil
+	}
+	for _, event := range events {
+		at := event.CreatedAt
+		switch event.Type {
+		case ActionEventExecutionStarted:
+			record.ExecutionStartedAt = &at
+			// An in-flight or interrupted dispatch has no proven result. This
+			// conservative projection also preserves legacy v3 executing rows.
+			record.ExecutionOutcome = RestartApplicationExecutionOutcomeUnknown
+		case ActionEventExecutionSucceeded:
+			record.ExecutionOutcome = RestartApplicationExecutionSucceeded
+			record.ExecutionCompletedAt = &at
+			record.OutcomeRecordedAt = &at
+		case ActionEventExecutionFailed, ActionEventExecutionOutcomeUnknown:
+			record.FailureCategory = event.FailureCategory
+			record.OutcomeRecordedAt = &at
+			if event.Type == ActionEventExecutionFailed {
+				record.ExecutionOutcome = RestartApplicationExecutionFailed
+				record.ExecutionCompletedAt = &at
+			}
+		}
+	}
+	return record, events, nil
 }
 
 // validStoredActionExecutionPolicy keeps pre-4B2 restart proposals readable

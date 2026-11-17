@@ -266,10 +266,10 @@ func TestRestartApplicationExecutorMapsSafeFailuresWithoutRetry(t *testing.T) {
 		},
 		{
 			name: "unknown internal error", restartError: errors.New("secret token at /private/path"),
-			wantOutcome: RestartApplicationExecutionFailed, wantState: ActionStateFailed,
+			wantOutcome: RestartApplicationExecutionOutcomeUnknown, wantState: ActionStateExecuting,
 			wantCategory:  ActionExecutionFailureInternalError,
-			wantError:     errRestartApplicationExecutionFailed,
-			wantEventType: ActionEventExecutionFailed,
+			wantError:     errRestartApplicationOutcomeUnknown,
+			wantEventType: ActionEventExecutionOutcomeUnknown,
 		},
 		{
 			name: "ambiguous response", restartError: miniDeployRestartFailure{
@@ -279,7 +279,7 @@ func TestRestartApplicationExecutorMapsSafeFailuresWithoutRetry(t *testing.T) {
 			wantState:     ActionStateExecuting,
 			wantCategory:  ActionExecutionFailureInvalidResponse,
 			wantError:     errRestartApplicationOutcomeUnknown,
-			wantEventType: ActionEventExecutionStarted,
+			wantEventType: ActionEventExecutionOutcomeUnknown,
 		},
 	}
 
@@ -346,6 +346,7 @@ func TestRestartApplicationExecutorClassifiesHTTPRejectionsWithoutRetry(t *testi
 			wantEventTypes: []ActionEventType{
 				ActionEventPolicyAuthorizedOnCreation,
 				ActionEventExecutionStarted,
+				ActionEventExecutionOutcomeUnknown,
 			},
 		},
 		{
