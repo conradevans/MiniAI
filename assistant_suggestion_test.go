@@ -21,6 +21,7 @@ func testAssistantSuggestionPacket() EvidencePacket {
 	packet.Subjects = []EvidenceSubject{{Kind: SubjectApplication, ID: "myscheduler", Name: "MyScheduler"}}
 	packet.Evidence[0].Subject = packet.Subjects[0]
 	packet.Evidence[0].Type = EvidenceTypeCurrentApplication
+	packet.Evidence[0].Fields = []EvidenceField{evidenceStringField("status", "exited")}
 	packet.Confidence = EvidencePacketConfidence{
 		Level: ConfidenceHigh, SoftwareCeiling: ConfidenceHigh,
 		Inputs: EvidencePacketConfidenceInputs{
@@ -76,7 +77,10 @@ func TestReasonerActionSuggestionUsesClosedEvidenceGroundedContract(t *testing.T
 		}
 	}
 	instruction := reasonerActionSuggestionInstruction(packet)
-	for _, required := range []string{"optional", "cannot execute", "cannot", "Never emit a target", "do not suggest one"} {
+	for _, required := range []string{
+		"optional", "cannot execute", "cannot", "Never emit a target", "do not suggest one",
+		"trusted current application evidence", "currently running or healthy", "historical failures", "logs contain errors",
+	} {
 		if !strings.Contains(instruction, required) {
 			t.Fatalf("suggestion instruction missing %q: %s", required, instruction)
 		}
@@ -317,7 +321,7 @@ func TestPhase2CValidAssistantRestartSuggestionPersistsWithoutExecution(t *testi
 	h := newPhase2CTestHarness(t, 12)
 	now := time.Date(2026, 9, 28, 5, 6, 47, 0, time.UTC)
 	h.app.phase2Now = func() time.Time { return now }
-	h.app.phase2Executor = productionApplicationIncidentExecutor(now)
+	h.app.phase2Executor = productionExitedApplicationIncidentExecutor(now)
 	h.responseBuilder = assistantSuggestionResponseBuilder
 	var miniDeployCalls atomic.Int64
 	miniDeploy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -409,7 +413,7 @@ func TestPhase2CDuplicateTopLevelActionSuggestionsPreserveAnswerWithoutAction(t 
 	h := newPhase2CTestHarness(t, 12)
 	now := time.Date(2026, 9, 28, 5, 6, 47, 0, time.UTC)
 	h.app.phase2Now = func() time.Time { return now }
-	h.app.phase2Executor = productionApplicationIncidentExecutor(now)
+	h.app.phase2Executor = productionExitedApplicationIncidentExecutor(now)
 	h.responseBuilder = func(request chatAPIRequest) string {
 		packet, err := evidencePacketFromReasonerRequest(request)
 		if err != nil {
@@ -811,7 +815,7 @@ func TestPhase2CFreeFormUserLanguageNeverConfirmsOrExecutesSuggestion(t *testing
 			h := newPhase2CTestHarness(t, 12)
 			now := time.Date(2026, 9, 28, 5, 6, 47, 0, time.UTC)
 			h.app.phase2Now = func() time.Time { return now }
-			h.app.phase2Executor = productionApplicationIncidentExecutor(now)
+			h.app.phase2Executor = productionExitedApplicationIncidentExecutor(now)
 			h.responseBuilder = assistantSuggestionResponseBuilder
 			stream := h.runChat(t, "assistant-free-form", "", question)
 			suggestion, ok := actionSuggestionFromStream(t, stream)

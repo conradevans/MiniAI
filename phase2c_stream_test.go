@@ -536,7 +536,7 @@ func TestPhase2CSlowReasonerEmitsSSECommentKeepalive(t *testing.T) {
 	now := time.Date(2026, 9, 28, 5, 6, 47, 0, time.UTC)
 	configure := func(h *phase2CTestHarness) {
 		h.app.phase2Now = func() time.Time { return now }
-		h.app.phase2Executor = productionApplicationRuntimeTrendExecutor(now)
+		h.app.phase2Executor = productionExitedApplicationIncidentExecutor(now)
 		h.responseBuilder = applicationRuntimeTrendNoSuggestionResponse
 	}
 

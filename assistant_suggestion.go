@@ -63,14 +63,15 @@ func reasonerActionSuggestionSchema(packet EvidencePacket) map[string]any {
 }
 
 func reasonerActionSuggestionInstruction(packet EvidencePacket) string {
+	const triggerRule = "A restart suggestion is allowed only when the supplied trusted current application evidence establishes a restart-worthy current state. A currently running or healthy application must not receive a restart suggestion merely because the user asks what should happen next, historical failures exist, logs contain errors, or a restart might theoretically be harmless."
 	if !reasonerActionSuggestionEligible(packet) {
-		return "Do not suggest an action for this investigation; omit action_suggestion or set it to null."
+		return "Do not suggest an action for this investigation; omit action_suggestion or set it to null. " + triggerRule
 	}
-	return "The normal evidence answer is primary. action_suggestion is optional: omit it or use null unless the evidence directly supports a restart as a reasonable recovery step. The only allowed suggestion type is restart_current_application with one concise user-facing reason and supporting evidence_ids. It is only a proposal and cannot execute, authorize, or confirm anything. Never emit a target, action kind, arguments, command, shell, systemctl or Docker instruction, URL, endpoint, port, origin, state, safety metadata, confirmation setting, or execution setting. If evidence is incomplete, conflicted, too uncertain, or does not support restart, do not suggest one."
+	return "The normal evidence answer is primary. " + triggerRule + " action_suggestion is optional: omit it or use null unless that trusted current-state evidence directly supports a restart as a reasonable recovery step. The only allowed suggestion type is restart_current_application with one concise user-facing reason and supporting evidence_ids. It is only a proposal and cannot execute, authorize, or confirm anything. Never emit a target, action kind, arguments, command, shell, systemctl or Docker instruction, URL, endpoint, port, origin, state, safety metadata, confirmation setting, or execution setting. If evidence is incomplete, conflicted, too uncertain, or does not support restart, do not suggest one."
 }
 
 func reasonerActionSuggestionEligible(packet EvidencePacket) bool {
-	if _, ok := trustedReasonerRestartTarget(packet); !ok || len(reasonerActionEvidenceReferenceEnum(packet)) == 0 {
+	if _, references, ok := reasonerRestartTriggerEvidence(packet); !ok || len(references) == 0 {
 		return false
 	}
 	if packet.Confidence.Level != ConfidenceHigh && packet.Confidence.Level != ConfidenceMedium {
@@ -105,35 +106,83 @@ func trustedReasonerRestartTarget(packet EvidencePacket) (ActionTarget, bool) {
 }
 
 func reasonerActionEvidenceReferenceEnum(packet EvidencePacket) []string {
-	target, ok := trustedReasonerRestartTarget(packet)
+	_, references, ok := reasonerRestartTriggerEvidence(packet)
 	if !ok {
 		return nil
 	}
-	references := make([]string, 0, len(packet.Evidence))
-	for _, item := range packet.Evidence {
-		if reasonerEvidenceSupportsRestartTarget(item, target) {
-			references = append(references, item.ID)
-		}
-	}
-	return sortedUniqueContractStrings(references)
+	return references
 }
 
 // Compaction intentionally elides a repeated item subject. In that case the closed
 // application evidence type plus the packet single-target invariant retains binding.
-func reasonerEvidenceSupportsRestartTarget(item EvidencePacketItem, target ActionTarget) bool {
-	if strings.TrimSpace(item.ID) == "" {
-		return false
-	}
-	switch item.Type {
-	case EvidenceTypeCurrentApplication, EvidenceTypeApplicationHistory, EvidenceTypeRuntimeFailures:
-	default:
-		return false
-	}
+func reasonerEvidenceBindsRestartTarget(item EvidencePacketItem, target ActionTarget) bool {
 	switch item.Subject.Kind {
 	case "", SubjectUnknown:
 		return item.Subject.ID == ""
 	case SubjectApplication:
 		return item.Subject.ID == target.ID
+	default:
+		return false
+	}
+}
+
+// reasonerRestartTriggerEvidence derives restart eligibility only from trusted,
+// typed current-state evidence. Historical symptoms and model-authored text are
+// intentionally excluded from this authorization input.
+func reasonerRestartTriggerEvidence(packet EvidencePacket) (ActionTarget, []string, bool) {
+	target, ok := trustedReasonerRestartTarget(packet)
+	if !ok {
+		return ActionTarget{}, nil, false
+	}
+	references := make([]string, 0, len(packet.Evidence))
+	currentState := ""
+	for _, item := range packet.Evidence {
+		if item.Type != EvidenceTypeCurrentApplication {
+			continue
+		}
+		if !reasonerEvidenceBindsRestartTarget(item, target) {
+			return ActionTarget{}, nil, false
+		}
+		status, valid := reasonerCurrentApplicationStatus(item)
+		if strings.TrimSpace(item.ID) == "" || item.Kind != EvidenceObserved || !valid || !reasonerRestartWorthyCurrentStatus(status) {
+			return ActionTarget{}, nil, false
+		}
+		if currentState != "" && currentState != status {
+			return ActionTarget{}, nil, false
+		}
+		currentState = status
+		references = append(references, item.ID)
+	}
+	references = sortedUniqueContractStrings(references)
+	if currentState == "" || len(references) == 0 {
+		return ActionTarget{}, nil, false
+	}
+	return target, references, true
+}
+
+func reasonerCurrentApplicationStatus(item EvidencePacketItem) (string, bool) {
+	status := ""
+	found := false
+	for _, field := range item.Fields {
+		if field.Name != "status" {
+			continue
+		}
+		if found || field.Value.Kind != EvidenceValueString {
+			return "", false
+		}
+		status = strings.ToLower(strings.TrimSpace(field.Value.String))
+		if status == "" || utf8.RuneCountInString(status) > evidencePacketStatusRunes {
+			return "", false
+		}
+		found = true
+	}
+	return status, found
+}
+
+func reasonerRestartWorthyCurrentStatus(status string) bool {
+	switch status {
+	case "exited":
+		return true
 	default:
 		return false
 	}
@@ -190,12 +239,13 @@ func validateReasonerActionSuggestion(
 		return nil, errInvalidReasonerActionSuggestion
 	}
 
-	allowed := map[string]bool{}
-	target, _ := trustedReasonerRestartTarget(packet)
-	for _, item := range packet.Evidence {
-		if reasonerEvidenceSupportsRestartTarget(item, target) {
-			allowed[item.ID] = true
-		}
+	target, triggerEvidence, ok := reasonerRestartTriggerEvidence(packet)
+	if !ok {
+		return nil, errInvalidReasonerActionSuggestion
+	}
+	allowed := make(map[string]bool, len(triggerEvidence))
+	for _, evidenceID := range triggerEvidence {
+		allowed[evidenceID] = true
 	}
 	if err := validateReasonerReferences(suggestion.EvidenceIDs, allowed, 6); err != nil {
 		return nil, errInvalidReasonerActionSuggestion
